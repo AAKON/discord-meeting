@@ -21,6 +21,11 @@ export function startTranscriptionWorker(): Worker<TranscriptionJobData> {
 
       const text = await transcribeAudio(audioFilePath);
 
+      if (!text.trim()) {
+        fs.unlinkSync(audioFilePath);
+        return;
+      }
+
       const startTimestamp = new Date(timestamp);
       const endTimestamp = new Date(timestamp + 15_000);
 
@@ -35,7 +40,7 @@ export function startTranscriptionWorker(): Worker<TranscriptionJobData> {
       });
 
       fs.unlinkSync(audioFilePath);
-      console.log(`[worker] Transcribed chunk ${chunkIndex} for ${displayName}`);
+      console.log(`[transcript] ${displayName} (chunk ${chunkIndex}): ${text}`);
     },
     {
       connection,

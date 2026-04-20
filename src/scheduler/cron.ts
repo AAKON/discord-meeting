@@ -6,6 +6,7 @@ import { config } from '../config';
 import { Meeting } from '../db/models/meeting';
 import { TranscriptEntry } from '../db/models/transcript';
 import { startVoiceCapture, stopVoiceCapture } from '../voice/capture';
+import { summarizeMeeting } from '../transcription/summarize';
 
 let scheduledMeetingId: string | null = null;
 let scheduledConnection: VoiceConnection | null = null;
@@ -125,13 +126,16 @@ export function startScheduler(): void {
       await new Promise((r) => setTimeout(r, 30_000));
 
       const entries = await TranscriptEntry.find({ meetingId }).sort({ startTimestamp: 1 });
-      const transcript = entries.map((e) => `**${e.displayName}**: ${e.text}`).join('\n');
 
       const textChannel = await getTextChannel();
-      if (transcript) {
-        await textChannel.send(`📝 **Meeting Transcript**\n\n${transcript}`);
+      if (entries.length) {
+        const transcript = entries.map((e) => `**${e.displayName}**: ${e.text}`).join('\n');
+        await textChannel.send(`📝 **Conversation**\n\n${transcript}`);
+
+        const summary = await summarizeMeeting(entries);
+        await textChannel.send(`📋 **Summary**\n\n${summary}`);
       }
-      await textChannel.send('✅ Meeting ended. Transcript posted above.');
+      await textChannel.send('✅ Meeting ended.');
     } catch (err) {
       console.error('[cron] Meeting end error:', err);
     }

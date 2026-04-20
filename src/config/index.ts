@@ -10,6 +10,7 @@ const configSchema = z.object({
   MONGODB_URI: z.string().min(1),
   REDIS_URL: z.string().min(1),
   GROQ_API_KEY: z.string().min(1),
+  DEEPGRAM_API_KEY: z.string().min(1),
   MEETING_VOICE_CHANNEL_ID: z.string().min(1),
   MEETING_TEXT_CHANNEL_ID: z.string().min(1),
   MEETING_TIME: z.string().regex(/^\d{2}:\d{2}$/, 'Format must be HH:MM'),

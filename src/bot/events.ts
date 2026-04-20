@@ -9,6 +9,7 @@ import { config } from '../config';
 import { Meeting } from '../db/models/meeting';
 import { TranscriptEntry } from '../db/models/transcript';
 import { startVoiceCapture, stopVoiceCapture } from '../voice/capture';
+import { summarizeMeeting } from '../transcription/summarize';
 
 let activeMeetingId: string | null = null;
 let activeConnection: VoiceConnection | null = null;
@@ -96,15 +97,18 @@ async function handleEndMeeting(interaction: ChatInputCommandInteraction): Promi
   await new Promise((r) => setTimeout(r, 10_000));
 
   const entries = await TranscriptEntry.find({ meetingId }).sort({ startTimestamp: 1 });
-  const transcript = entries.map((e) => `**${e.displayName}**: ${e.text}`).join('\n');
 
   const textChannel = await getTextChannel();
-  if (transcript) {
-    await textChannel.send(`📝 **Meeting Transcript**\n\n${transcript}`);
+  if (entries.length) {
+    const transcript = entries.map((e) => `**${e.displayName}**: ${e.text}`).join('\n');
+    await textChannel.send(`📝 **Conversation**\n\n${transcript}`);
+
+    const summary = await summarizeMeeting(entries);
+    await textChannel.send(`📋 **Summary**\n\n${summary}`);
   } else {
-    await textChannel.send('No transcript entries recorded.');
+    await textChannel.send('No speech recorded.');
   }
-  await textChannel.send('✅ Meeting ended. Transcript posted above.');
+  await textChannel.send('✅ Meeting ended.');
   await interaction.editReply('Meeting ended.');
 }
 

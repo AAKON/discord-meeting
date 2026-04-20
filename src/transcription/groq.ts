@@ -1,14 +1,26 @@
-import Groq from 'groq-sdk';
 import fs from 'fs';
 import { config } from '../config';
 
-const groq = new Groq({ apiKey: config.GROQ_API_KEY });
-
 export async function transcribeAudio(audioFilePath: string): Promise<string> {
-  const stream = fs.createReadStream(audioFilePath);
-  const result = await groq.audio.transcriptions.create({
-    file: stream,
-    model: 'whisper-large-v3',
-  });
-  return result.text;
+  const audioBuffer = fs.readFileSync(audioFilePath);
+
+  const response = await fetch(
+    'https://api.deepgram.com/v1/listen?language=bn&model=nova-3&smart_format=true',
+    {
+      method: 'POST',
+      headers: {
+        'Authorization': `Token ${config.DEEPGRAM_API_KEY}`,
+        'Content-Type': 'audio/wav',
+      },
+      body: audioBuffer,
+    }
+  );
+
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`Deepgram error: ${err}`);
+  }
+
+  const data = await response.json() as any;
+  return data?.results?.channels?.[0]?.alternatives?.[0]?.transcript ?? '';
 }
