@@ -13,8 +13,13 @@ export async function summarizeMeeting(
     max_tokens: 1024,
     messages: [
       {
+        role: 'system',
+        content:
+          'You are a meeting summarizer. The conversation may be in Bangla, English, or mixed. Respond in English. List: 1) Key discussion points, 2) Decisions made, 3) Action items. Keep it concise.',
+      },
+      {
         role: 'user',
-        content: `You are summarizing a meeting conversation that may be in Bangla, English, or mixed. Respond in English. List: 1) Key discussion points, 2) Decisions made, 3) Action items. Keep it concise.\n\nConversation:\n${conversation}`,
+        content: `Summarize this meeting conversation:\n\n${conversation}`,
       },
     ],
   });

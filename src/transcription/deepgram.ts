@@ -1,6 +1,16 @@
 import fs from 'fs';
 import { config } from '../config';
 
+interface DeepgramResponse {
+  results?: {
+    channels?: {
+      alternatives?: {
+        transcript?: string;
+      }[];
+    }[];
+  };
+}
+
 export async function transcribeAudio(audioFilePath: string): Promise<string> {
   const audioBuffer = fs.readFileSync(audioFilePath);
 
@@ -9,7 +19,7 @@ export async function transcribeAudio(audioFilePath: string): Promise<string> {
     {
       method: 'POST',
       headers: {
-        'Authorization': `Token ${config.DEEPGRAM_API_KEY}`,
+        Authorization: `Token ${config.DEEPGRAM_API_KEY}`,
         'Content-Type': 'audio/wav',
       },
       body: audioBuffer,
@@ -18,9 +28,9 @@ export async function transcribeAudio(audioFilePath: string): Promise<string> {
 
   if (!response.ok) {
     const err = await response.text();
-    throw new Error(`Deepgram error: ${err}`);
+    throw new Error(`Deepgram error ${response.status}: ${err}`);
   }
 
-  const data = await response.json() as any;
+  const data = (await response.json()) as DeepgramResponse;
   return data?.results?.channels?.[0]?.alternatives?.[0]?.transcript ?? '';
 }

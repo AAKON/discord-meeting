@@ -27,6 +27,23 @@ const commands = [
   new SlashCommandBuilder()
     .setName('attendance')
     .setDescription('Show who joined the last meeting'),
+
+  new SlashCommandBuilder()
+    .setName('assign-task')
+    .setDescription('Assign a task to someone during the meeting')
+    .addStringOption((opt) =>
+      opt.setName('assigned-to').setDescription('Who is the task assigned to').setRequired(true)
+    )
+    .addStringOption((opt) =>
+      opt.setName('title').setDescription('Task title').setRequired(true)
+    )
+    .addStringOption((opt) =>
+      opt.setName('description').setDescription('Task details (optional)').setRequired(false)
+    ),
+
+  new SlashCommandBuilder()
+    .setName('show-tasks')
+    .setDescription('Show all tasks assigned in the latest meeting'),
 ].map((cmd) => cmd.toJSON());
 
 export async function registerCommands(): Promise<void> {

@@ -2,17 +2,25 @@ import {
   ChatInputCommandInteraction,
   GuildMember,
   TextChannel,
+  VoiceState,
 } from 'discord.js';
 import { joinVoiceChannel, VoiceConnectionStatus, entersState, VoiceConnection } from '@discordjs/voice';
 import { client } from './index';
 import { config } from '../config';
 import { Meeting } from '../db/models/meeting';
 import { TranscriptEntry } from '../db/models/transcript';
-import { startVoiceCapture, stopVoiceCapture } from '../voice/capture';
+import { Task } from '../db/models/task';
+import { startVoiceCapture, stopVoiceCapture, stopUserCapture } from '../voice/capture';
 import { summarizeMeeting } from '../transcription/summarize';
+import { extractTasksFromMeeting, getTasksByAssignee } from '../transcription/tasks';
+import { sendLongMessage } from './utils';
+import { transcriptionQueue } from '../queue';
+import { waitForQueueDrain } from '../utils/queue';
+import mongoose from 'mongoose';
 
 let activeMeetingId: string | null = null;
 let activeConnection: VoiceConnection | null = null;
+let earlyLeaverListener: ((o: VoiceState, n: VoiceState) => void) | null = null;
 
 export function getActiveMeetingId(): string | null { return activeMeetingId; }
 export function getActiveConnection(): VoiceConnection | null { return activeConnection; }
@@ -62,10 +70,29 @@ async function handleStartMeeting(interaction: ChatInputCommandInteraction): Pro
   await entersState(connection, VoiceConnectionStatus.Ready, 10_000);
   activeConnection = connection;
 
-  const participants = buildParticipantMap(guild.id);
-  startVoiceCapture(connection, activeMeetingId, participants);
-
   const textChannel = await getTextChannel();
+  const meetingIdForCapture = activeMeetingId;
+
+  earlyLeaverListener = (oldState: VoiceState, newState: VoiceState) => {
+    if (!activeMeetingId) return;
+    if (oldState.channelId !== config.MEETING_VOICE_CHANNEL_ID) return;
+    if (newState.channelId === config.MEETING_VOICE_CHANNEL_ID) return;
+    if (newState.id === client.user?.id) return;
+    const displayName = oldState.member?.displayName ?? newState.id;
+    stopUserCapture(meetingIdForCapture!, newState.id).catch(console.error);
+    textChannel.send(`⚠️ **${displayName}** left the meeting early.`).catch(console.error);
+  };
+  client.on('voiceStateUpdate', earlyLeaverListener);
+
+  const participants = buildParticipantMap(guild.id);
+  startVoiceCapture(connection, activeMeetingId, participants, {
+    resolveDisplayName: (userId) =>
+      guild.members.cache.get(userId)?.displayName ?? userId,
+    onLateJoiner: (_, displayName) => {
+      textChannel.send(`🕐 **${displayName}** joined late.`).catch(console.error);
+    },
+  });
+
   await textChannel.send('🔴 Meeting started. Recording...');
   await interaction.editReply('Meeting started.');
 }
@@ -81,30 +108,50 @@ async function handleEndMeeting(interaction: ChatInputCommandInteraction): Promi
   const meetingId = activeMeetingId;
   activeMeetingId = null;
 
+  if (earlyLeaverListener) {
+    client.off('voiceStateUpdate', earlyLeaverListener);
+    earlyLeaverListener = null;
+  }
+
   await stopVoiceCapture(meetingId);
 
-  const guild = interaction.guild!;
-  const connection = joinVoiceChannel({
-    channelId: config.MEETING_VOICE_CHANNEL_ID,
-    guildId: guild.id,
-    adapterCreator: guild.voiceAdapterCreator,
-  });
-  connection.destroy();
+  activeConnection?.destroy();
+  activeConnection = null;
 
-  await Meeting.findByIdAndUpdate(meetingId, { status: 'completed', endTime: new Date() });
+  const endTime = new Date();
+  await Meeting.findByIdAndUpdate(meetingId, { status: 'completed', endTime });
 
-  // Wait for remaining transcription jobs
-  await new Promise((r) => setTimeout(r, 10_000));
+  await waitForQueueDrain(transcriptionQueue);
 
   const entries = await TranscriptEntry.find({ meetingId }).sort({ startTimestamp: 1 });
 
   const textChannel = await getTextChannel();
   if (entries.length) {
     const transcript = entries.map((e) => `**${e.displayName}**: ${e.text}`).join('\n');
-    await textChannel.send(`📝 **Conversation**\n\n${transcript}`);
+    await sendLongMessage(textChannel, transcript, '📝 **Conversation**\n');
+
+    // Extract and display tasks
+    await extractTasksFromMeeting(meetingId, entries);
+    const tasksByAssignee = await getTasksByAssignee(meetingId);
+
+    if (tasksByAssignee.size > 0) {
+      let tasksMessage = '📋 **Task Assignments**\n\n';
+      for (const [assignee, tasks] of tasksByAssignee) {
+        tasksMessage += `👤 **${assignee}**\n`;
+        for (const task of tasks) {
+          tasksMessage += `  • ${task.title}`;
+          if (task.description) {
+            tasksMessage += ` - ${task.description}`;
+          }
+          tasksMessage += '\n';
+        }
+        tasksMessage += '\n';
+      }
+      await textChannel.send(tasksMessage);
+    }
 
     const summary = await summarizeMeeting(entries);
-    await textChannel.send(`📋 **Summary**\n\n${summary}`);
+    await sendLongMessage(textChannel, summary, '📋 **Summary**\n');
   } else {
     await textChannel.send('No speech recorded.');
   }
@@ -129,7 +176,7 @@ async function handleMeetingSummary(interaction: ChatInputCommandInteraction): P
 
   const transcript = entries.map((e) => `**${e.displayName}**: ${e.text}`).join('\n');
   const textChannel = await getTextChannel();
-  await textChannel.send(`📝 **Summary — ${meeting.title}**\n\n${transcript}`);
+  await sendLongMessage(textChannel, transcript, `📝 **Summary — ${meeting.title}**\n`);
   await interaction.editReply('Summary posted.');
 }
 
@@ -151,6 +198,64 @@ async function handleAttendance(interaction: ChatInputCommandInteraction): Promi
   await interaction.editReply(
     `👥 **Attendance — ${meeting.title}**\n${speakers.map((s: string) => `• ${s}`).join('\n')}`
   );
+}
+
+async function handleAssignTask(interaction: ChatInputCommandInteraction): Promise<void> {
+  await interaction.deferReply();
+
+  const assignedTo = interaction.options.getString('assigned-to', true);
+  const title = interaction.options.getString('title', true);
+  const description = interaction.options.getString('description', false);
+
+  if (!activeMeetingId) {
+    await interaction.editReply('No active meeting. Start a meeting first.');
+    return;
+  }
+
+  const task = await Task.create({
+    meetingId: new mongoose.Types.ObjectId(activeMeetingId),
+    assignedTo,
+    title,
+    description: description || undefined,
+    status: 'assigned',
+  });
+
+  const textChannel = await getTextChannel();
+  await textChannel.send(`📌 **Task Assigned**\n👤 **${assignedTo}**: ${title}${description ? `\n${description}` : ''}`);
+
+  await interaction.editReply('Task assigned successfully.');
+}
+
+async function handleShowTasks(interaction: ChatInputCommandInteraction): Promise<void> {
+  await interaction.deferReply();
+
+  const meeting = await Meeting.findOne({ status: 'completed' }).sort({ endTime: -1 });
+  if (!meeting) {
+    await interaction.editReply('No completed meetings found.');
+    return;
+  }
+
+  const tasksByAssignee = await getTasksByAssignee(meeting._id.toString());
+
+  if (tasksByAssignee.size === 0) {
+    await interaction.editReply('No tasks found for the latest meeting.');
+    return;
+  }
+
+  let tasksMessage = '📋 **Tasks — Latest Meeting**\n\n';
+  for (const [assignee, tasks] of tasksByAssignee) {
+    tasksMessage += `👤 **${assignee}**\n`;
+    for (const task of tasks) {
+      tasksMessage += `  • ${task.title}`;
+      if (task.description) {
+        tasksMessage += ` - ${task.description}`;
+      }
+      tasksMessage += '\n';
+    }
+    tasksMessage += '\n';
+  }
+
+  await interaction.editReply(tasksMessage);
 }
 
 async function handleCreateMeeting(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -188,6 +293,8 @@ export function registerEvents(): void {
         case 'end-meeting':    await handleEndMeeting(interaction);    break;
         case 'meeting-summary': await handleMeetingSummary(interaction); break;
         case 'attendance':     await handleAttendance(interaction);    break;
+        case 'assign-task':    await handleAssignTask(interaction);    break;
+        case 'show-tasks':     await handleShowTasks(interaction);     break;
       }
     } catch (err) {
       console.error(`[events] Command error:`, err);

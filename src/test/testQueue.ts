@@ -14,6 +14,7 @@ import { connectDB } from '../db/mongoose';
     audioFilePath: '/nonexistent/sample.wav',
     chunkIndex: 0,
     timestamp: Date.now(),
+    flushTime: Date.now(),
   });
 
   console.log(`Job added: ${job.id}`);

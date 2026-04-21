@@ -16,6 +16,7 @@ const configSchema = z.object({
   MEETING_TIME: z.string().regex(/^\d{2}:\d{2}$/, 'Format must be HH:MM'),
   MEETING_DURATION_MINUTES: z.coerce.number().positive(),
   REMINDER_MINUTES_BEFORE: z.coerce.number().positive(),
+  TIMEZONE: z.string().default('Asia/Dhaka'),
 });
 
 const parsed = configSchema.safeParse(process.env);

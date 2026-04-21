@@ -2,7 +2,7 @@ import { Worker } from 'bullmq';
 import fs from 'fs';
 import mongoose from 'mongoose';
 import { config } from '../config';
-import { transcribeAudio } from './groq';
+import { transcribeAudio } from './deepgram';
 import { TranscriptEntry } from '../db/models/transcript';
 import type { TranscriptionJobData } from '../queue';
 
@@ -12,7 +12,7 @@ export function startTranscriptionWorker(): Worker<TranscriptionJobData> {
   const worker = new Worker<TranscriptionJobData>(
     'transcription-queue',
     async (job) => {
-      const { meetingId, userId, displayName, audioFilePath, chunkIndex, timestamp } = job.data;
+      const { meetingId, userId, displayName, audioFilePath, chunkIndex, timestamp, flushTime } = job.data;
 
       if (!fs.existsSync(audioFilePath)) {
         console.warn(`[worker] Audio file not found, skipping: ${audioFilePath}`);
@@ -26,15 +26,12 @@ export function startTranscriptionWorker(): Worker<TranscriptionJobData> {
         return;
       }
 
-      const startTimestamp = new Date(timestamp);
-      const endTimestamp = new Date(timestamp + 15_000);
-
       await TranscriptEntry.create({
         meetingId: new mongoose.Types.ObjectId(meetingId),
         discordUserId: userId,
         displayName,
-        startTimestamp,
-        endTimestamp,
+        startTimestamp: new Date(timestamp),
+        endTimestamp: new Date(flushTime),
         text,
         chunkIndex,
       });
@@ -42,14 +39,15 @@ export function startTranscriptionWorker(): Worker<TranscriptionJobData> {
       fs.unlinkSync(audioFilePath);
       console.log(`[transcript] ${displayName} (chunk ${chunkIndex}): ${text}`);
     },
-    {
-      connection,
-      concurrency: 5,
-    }
+    { connection, concurrency: 5 }
   );
 
   worker.on('failed', (job, err) => {
     console.error(`[worker] Job ${job?.id} failed: ${err.message}`);
+    const filePath = job?.data.audioFilePath;
+    if (filePath && fs.existsSync(filePath)) {
+      try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+    }
   });
 
   return worker;

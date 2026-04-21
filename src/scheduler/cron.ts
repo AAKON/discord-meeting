@@ -1,15 +1,40 @@
 import cron from 'node-cron';
 import { joinVoiceChannel, VoiceConnectionStatus, entersState, VoiceConnection } from '@discordjs/voice';
-import { TextChannel } from 'discord.js';
+import { TextChannel, VoiceState } from 'discord.js';
 import { client } from '../bot/index';
 import { config } from '../config';
 import { Meeting } from '../db/models/meeting';
 import { TranscriptEntry } from '../db/models/transcript';
-import { startVoiceCapture, stopVoiceCapture } from '../voice/capture';
+import { startVoiceCapture, stopVoiceCapture, stopUserCapture } from '../voice/capture';
 import { summarizeMeeting } from '../transcription/summarize';
+import { extractTasksFromMeeting, getTasksByAssignee } from '../transcription/tasks';
+import { sendLongMessage } from '../bot/utils';
+import { transcriptionQueue } from '../queue';
+import { waitForQueueDrain } from '../utils/queue';
 
 let scheduledMeetingId: string | null = null;
 let scheduledConnection: VoiceConnection | null = null;
+let earlyLeaverListener: ((o: VoiceState, n: VoiceState) => void) | null = null;
+
+function getUTCHourOffset(): number {
+  const timezones: Record<string, number> = {
+    'Asia/Dhaka': 6,
+    'Asia/Kolkata': 5.5,
+    'UTC': 0,
+    'America/New_York': -5,
+    'Europe/London': 0,
+  };
+  const tz = config.TIMEZONE;
+  return timezones[tz] ?? 0;
+}
+
+function convertToUTCTime(hhmm: string, tzOffset: number): string {
+  const [h, m] = hhmm.split(':').map(Number);
+  const totalMinutes = h * 60 + m - Math.round(tzOffset * 60);
+  const newH = ((totalMinutes / 60) % 24 + 24) % 24;
+  const newM = totalMinutes % 60;
+  return `${String(Math.floor(newH)).padStart(2, '0')}:${String(newM).padStart(2, '0')}`;
+}
 
 function timeToCron(hhmm: string): string {
   const [h, m] = hhmm.split(':');
@@ -52,12 +77,18 @@ export function startScheduler(): void {
   const meetingTime = config.MEETING_TIME;
   const duration = config.MEETING_DURATION_MINUTES;
   const reminderOffset = config.REMINDER_MINUTES_BEFORE;
+  const tzOffset = getUTCHourOffset();
 
   const reminderTime = subtractMinutes(meetingTime, reminderOffset);
   const endTime = addMinutes(meetingTime, duration);
 
+  // Convert to UTC for cron scheduling
+  const utcMeetingTime = convertToUTCTime(meetingTime, tzOffset);
+  const utcReminderTime = convertToUTCTime(reminderTime, tzOffset);
+  const utcEndTime = convertToUTCTime(endTime, tzOffset);
+
   // Reminder
-  cron.schedule(timeToCron(reminderTime), async () => {
+  cron.schedule(timeToCron(utcReminderTime), async () => {
     try {
       const textChannel = await getTextChannel();
       await textChannel.send(
@@ -69,7 +100,7 @@ export function startScheduler(): void {
   });
 
   // Meeting start
-  cron.schedule(timeToCron(meetingTime), async () => {
+  cron.schedule(timeToCron(utcMeetingTime), async () => {
     try {
       const guild = client.guilds.cache.get(config.DISCORD_GUILD_ID)
         ?? await client.guilds.fetch(config.DISCORD_GUILD_ID);
@@ -96,10 +127,29 @@ export function startScheduler(): void {
 
       await entersState(scheduledConnection, VoiceConnectionStatus.Ready, 10_000);
 
-      const participants = buildParticipantMap(guild.id);
-      startVoiceCapture(scheduledConnection, scheduledMeetingId, participants);
-
       const textChannel = await getTextChannel();
+      const capturedMeetingId = scheduledMeetingId;
+
+      earlyLeaverListener = (oldState: VoiceState, newState: VoiceState) => {
+        if (!scheduledMeetingId) return;
+        if (oldState.channelId !== config.MEETING_VOICE_CHANNEL_ID) return;
+        if (newState.channelId === config.MEETING_VOICE_CHANNEL_ID) return;
+        if (newState.id === client.user?.id) return;
+        const displayName = oldState.member?.displayName ?? newState.id;
+        stopUserCapture(capturedMeetingId!, newState.id).catch(console.error);
+        textChannel.send(`⚠️ **${displayName}** left the meeting early.`).catch(console.error);
+      };
+      client.on('voiceStateUpdate', earlyLeaverListener);
+
+      const participants = buildParticipantMap(guild.id);
+      startVoiceCapture(scheduledConnection, scheduledMeetingId, participants, {
+        resolveDisplayName: (userId) =>
+          guild.members.cache.get(userId)?.displayName ?? userId,
+        onLateJoiner: (_, displayName) => {
+          textChannel.send(`🕐 **${displayName}** joined late.`).catch(console.error);
+        },
+      });
+
       await textChannel.send('🔴 Meeting started. Recording...');
     } catch (err) {
       console.error('[cron] Meeting start error:', err);
@@ -107,12 +157,17 @@ export function startScheduler(): void {
   });
 
   // Meeting end
-  cron.schedule(timeToCron(endTime), async () => {
+  cron.schedule(timeToCron(utcEndTime), async () => {
     try {
       if (!scheduledMeetingId) return;
 
       const meetingId = scheduledMeetingId;
       scheduledMeetingId = null;
+
+      if (earlyLeaverListener) {
+        client.off('voiceStateUpdate', earlyLeaverListener);
+        earlyLeaverListener = null;
+      }
 
       await stopVoiceCapture(meetingId);
 
@@ -123,17 +178,68 @@ export function startScheduler(): void {
 
       await Meeting.findByIdAndUpdate(meetingId, { status: 'completed', endTime: new Date() });
 
-      await new Promise((r) => setTimeout(r, 30_000));
+      await waitForQueueDrain(transcriptionQueue);
 
+      const meeting = await Meeting.findById(meetingId);
       const entries = await TranscriptEntry.find({ meetingId }).sort({ startTimestamp: 1 });
 
       const textChannel = await getTextChannel();
+
+      // Display meeting duration
+      if (meeting && meeting.startTime && meeting.endTime) {
+        const durationMs = meeting.endTime.getTime() - meeting.startTime.getTime();
+        const durationMins = Math.floor(durationMs / 60_000);
+        const durationSecs = Math.floor((durationMs % 60_000) / 1_000);
+        const durationStr = `${durationMins}m ${durationSecs}s`;
+
+        // Display participant info
+        let participantInfo = '';
+        if (meeting.participants && meeting.participants.length > 0) {
+          const lateJoiners = meeting.participants.filter((p) => p.isLateJoiner).map((p) => p.displayName);
+          const earlyLeavers = meeting.participants.filter((p) => p.isEarlyLeaver).map((p) => p.displayName);
+
+          if (lateJoiners.length > 0 || earlyLeavers.length > 0) {
+            participantInfo += '\n';
+            if (lateJoiners.length > 0) {
+              participantInfo += `⏰ **Late Joiners**: ${lateJoiners.join(', ')}\n`;
+            }
+            if (earlyLeavers.length > 0) {
+              participantInfo += `🚪 **Early Leavers**: ${earlyLeavers.join(', ')}`;
+            }
+          }
+        }
+
+        await textChannel.send(
+          `⏱️ **Meeting Duration**: ${durationStr}${participantInfo}`
+        );
+      }
+
       if (entries.length) {
         const transcript = entries.map((e) => `**${e.displayName}**: ${e.text}`).join('\n');
-        await textChannel.send(`📝 **Conversation**\n\n${transcript}`);
+        await sendLongMessage(textChannel, transcript, '📝 **Conversation**\n');
+
+        // Extract and display tasks
+        await extractTasksFromMeeting(meetingId, entries);
+        const tasksByAssignee = await getTasksByAssignee(meetingId);
+
+        if (tasksByAssignee.size > 0) {
+          let tasksMessage = '📋 **Task Assignments**\n\n';
+          for (const [assignee, tasks] of tasksByAssignee) {
+            tasksMessage += `👤 **${assignee}**\n`;
+            for (const task of tasks) {
+              tasksMessage += `  • ${task.title}`;
+              if (task.description) {
+                tasksMessage += ` - ${task.description}`;
+              }
+              tasksMessage += '\n';
+            }
+            tasksMessage += '\n';
+          }
+          await textChannel.send(tasksMessage);
+        }
 
         const summary = await summarizeMeeting(entries);
-        await textChannel.send(`📋 **Summary**\n\n${summary}`);
+        await sendLongMessage(textChannel, summary, '📋 **Summary**\n');
       }
       await textChannel.send('✅ Meeting ended.');
     } catch (err) {
@@ -142,6 +248,6 @@ export function startScheduler(): void {
   });
 
   console.log(
-    `[cron] Scheduled — reminder: ${reminderTime}, start: ${meetingTime}, end: ${endTime}`
+    `[cron] Scheduled (${config.TIMEZONE}) — reminder: ${reminderTime}, start: ${meetingTime}, end: ${endTime}`
   );
 }

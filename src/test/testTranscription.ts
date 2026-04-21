@@ -1,5 +1,5 @@
 import path from 'path';
-import { transcribeAudio } from '../transcription/groq';
+import { transcribeAudio } from '../transcription/deepgram';
 
 const samplePath = path.resolve(__dirname, '../../test/sample.wav');
 

@@ -2,6 +2,15 @@ import mongoose, { Document, Schema } from 'mongoose';
 
 export type MeetingStatus = 'scheduled' | 'active' | 'completed' | 'cancelled';
 
+export interface IParticipant {
+  userId: string;
+  displayName: string;
+  joinTime: Date;
+  leaveTime?: Date;
+  isLateJoiner: boolean;
+  isEarlyLeaver: boolean;
+}
+
 export interface IMeeting extends Document {
   title: string;
   scheduledTime: Date;
@@ -11,7 +20,17 @@ export interface IMeeting extends Document {
   voiceChannelId: string;
   textChannelId: string;
   status: MeetingStatus;
+  participants?: IParticipant[];
 }
+
+const ParticipantSchema = new Schema<IParticipant>({
+  userId: { type: String, required: true },
+  displayName: { type: String, required: true },
+  joinTime: { type: Date, required: true },
+  leaveTime: { type: Date },
+  isLateJoiner: { type: Boolean, default: false },
+  isEarlyLeaver: { type: Boolean, default: false },
+});
 
 const MeetingSchema = new Schema<IMeeting>(
   {
@@ -27,6 +46,7 @@ const MeetingSchema = new Schema<IMeeting>(
       enum: ['scheduled', 'active', 'completed', 'cancelled'],
       default: 'scheduled',
     },
+    participants: [ParticipantSchema],
   },
   { timestamps: true }
 );

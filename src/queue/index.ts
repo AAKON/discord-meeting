@@ -8,6 +8,7 @@ export interface TranscriptionJobData {
   audioFilePath: string;
   chunkIndex: number;
   timestamp: number;
+  flushTime: number;
 }
 
 const connection = {

@@ -7,6 +7,10 @@ import { client } from './bot/index';
 import { config } from './config';
 import { joinVoiceChannel, VoiceConnectionStatus, entersState } from '@discordjs/voice';
 import { TextChannel } from 'discord.js';
+import mongoose from 'mongoose';
+import { startVoiceCapture, resetCapture } from './voice/capture';
+import { transcriptionQueue } from './queue';
+import { buildParticipantMap } from './utils/discord';
 
 const MAX_RECONNECT_ATTEMPTS = 3;
 
@@ -42,6 +46,15 @@ async function attemptReconnect(meetingId: string, attempt = 1): Promise<void> {
     await entersState(connection, VoiceConnectionStatus.Ready, 10_000);
     setActiveConnection(connection);
     console.log('[reconnect] Reconnected to voice channel.');
+
+    // Discard broken capture streams and restart fresh on new connection
+    resetCapture(meetingId);
+    const reconnectGuild = client.guilds.cache.get(config.DISCORD_GUILD_ID);
+    if (reconnectGuild) {
+      const participants = buildParticipantMap(reconnectGuild.id);
+      startVoiceCapture(connection, meetingId, participants);
+      console.log('[reconnect] Voice capture restarted.');
+    }
 
     connection.on('stateChange', (_old, newState) => {
       if (
@@ -88,7 +101,18 @@ async function main(): Promise<void> {
     }
   });
 
-  await client.login(config.DISCORD_TOKEN);
+  try {
+    console.log('[app] Logging in to Discord...');
+    await Promise.race([
+      client.login(config.DISCORD_TOKEN),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('Discord login timeout after 30s')), 30_000)
+      ),
+    ]);
+  } catch (err) {
+    console.error('[app] Discord login error:', err);
+    throw err;
+  }
 }
 
 process.on('uncaughtException', (err) => {
@@ -100,6 +124,21 @@ process.on('uncaughtException', (err) => {
 process.on('unhandledRejection', (reason) => {
   console.error('[app] Unhandled rejection:', reason);
 });
+
+async function shutdown(): Promise<void> {
+  console.log('[app] Shutting down...');
+  try {
+    getActiveConnection()?.destroy();
+    await transcriptionQueue.close();
+    await mongoose.connection.close();
+  } catch (err) {
+    console.error('[app] Shutdown error:', err);
+  }
+  process.exit(0);
+}
+
+process.on('SIGTERM', () => { shutdown().catch(console.error); });
+process.on('SIGINT',  () => { shutdown().catch(console.error); });
 
 main().catch((err) => {
   console.error('[app] Fatal startup error:', err);

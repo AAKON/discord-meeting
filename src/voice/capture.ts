@@ -14,9 +14,28 @@ interface UserCapture {
   writeStream: fs.WriteStream;
   pcmPath: string;
   timer: NodeJS.Timeout;
+  displayName: string;
+  joinTime: number;
 }
 
-const activeMeetings = new Map<string, Map<string, UserCapture>>();
+export interface CaptureOptions {
+  onLateJoiner?: (userId: string, displayName: string) => void;
+  resolveDisplayName?: (userId: string) => string;
+}
+
+export interface ParticipantInfo {
+  userId: string;
+  displayName: string;
+  joinTime: number;
+  meetingStartTime: number;
+}
+
+interface MeetingEntry {
+  userMap: Map<string, UserCapture>;
+  startTime: number;
+}
+
+const activeMeetings = new Map<string, MeetingEntry>();
 
 async function flushUserChunk(
   meetingId: string,
@@ -44,6 +63,7 @@ async function flushUserChunk(
     audioFilePath: wavPath,
     chunkIndex,
     timestamp: chunkStartTime,
+    flushTime: Date.now(),
   });
 }
 
@@ -55,6 +75,7 @@ function startUserStream(
   userMap: Map<string, UserCapture>
 ): void {
   const receiver = connection.receiver;
+  const joinTime = Date.now();
 
   const startChunk = (chunkIndex: number): void => {
     const chunkStartTime = Date.now();
@@ -82,7 +103,7 @@ function startUserStream(
       }
     }, CHUNK_INTERVAL_MS);
 
-    userMap.set(userId, { chunkIndex, chunkStartTime, writeStream, pcmPath, timer });
+    userMap.set(userId, { chunkIndex, chunkStartTime, writeStream, pcmPath, timer, displayName, joinTime });
   };
 
   startChunk(0);
@@ -91,12 +112,13 @@ function startUserStream(
 export function startVoiceCapture(
   connection: VoiceConnection,
   meetingId: string,
-  participants: Map<string, string>
+  participants: Map<string, string>,
+  options: CaptureOptions = {}
 ): void {
   if (!fs.existsSync(CHUNKS_DIR)) fs.mkdirSync(CHUNKS_DIR, { recursive: true });
 
   const userMap = new Map<string, UserCapture>();
-  activeMeetings.set(meetingId, userMap);
+  activeMeetings.set(meetingId, { userMap, startTime: Date.now() });
 
   for (const [userId, displayName] of participants) {
     startUserStream(connection, meetingId, userId, displayName, userMap);
@@ -104,27 +126,63 @@ export function startVoiceCapture(
 
   connection.receiver.speaking.on('start', (userId) => {
     if (userMap.has(userId)) return;
-    const displayName = participants.get(userId) ?? userId;
+    const displayName =
+      participants.get(userId) ??
+      options.resolveDisplayName?.(userId) ??
+      userId;
+    participants.set(userId, displayName);
     startUserStream(connection, meetingId, userId, displayName, userMap);
+    options.onLateJoiner?.(userId, displayName);
   });
 }
 
-export async function stopVoiceCapture(meetingId: string): Promise<void> {
-  const userMap = activeMeetings.get(meetingId);
-  if (!userMap) return;
+export async function stopUserCapture(meetingId: string, userId: string): Promise<void> {
+  const entry = activeMeetings.get(meetingId);
+  if (!entry) return;
+  const capture = entry.userMap.get(userId);
+  if (!capture) return;
+  clearTimeout(capture.timer);
+  entry.userMap.delete(userId);
+  await flushUserChunk(meetingId, userId, capture.displayName, capture).catch((err) =>
+    console.error(`[capture] Early leaver flush error for ${capture.displayName}: ${err.message}`)
+  );
+}
 
+export async function stopVoiceCapture(meetingId: string): Promise<ParticipantInfo[]> {
+  const entry = activeMeetings.get(meetingId);
+  if (!entry) return [];
+
+  const { userMap, startTime } = entry;
+  const participants: ParticipantInfo[] = [];
   const flushPromises: Promise<void>[] = [];
 
   for (const [userId, capture] of userMap) {
     clearTimeout(capture.timer);
-    const displayName = userId;
+    participants.push({
+      userId,
+      displayName: capture.displayName,
+      joinTime: capture.joinTime,
+      meetingStartTime: startTime,
+    });
     flushPromises.push(
-      flushUserChunk(meetingId, userId, displayName, capture).catch((err) =>
-        console.error(`[capture] Final flush error for ${userId}: ${err.message}`)
+      flushUserChunk(meetingId, userId, capture.displayName, capture).catch((err) =>
+        console.error(`[capture] Final flush error for ${capture.displayName}: ${err.message}`)
       )
     );
   }
 
   await Promise.all(flushPromises);
+  activeMeetings.delete(meetingId);
+  return participants;
+}
+
+export function resetCapture(meetingId: string): void {
+  const entry = activeMeetings.get(meetingId);
+  if (!entry) return;
+  for (const [, capture] of entry.userMap) {
+    clearTimeout(capture.timer);
+    try { capture.writeStream.destroy(); } catch { /* ignore */ }
+    try { if (fs.existsSync(capture.pcmPath)) fs.unlinkSync(capture.pcmPath); } catch { /* ignore */ }
+  }
   activeMeetings.delete(meetingId);
 }
