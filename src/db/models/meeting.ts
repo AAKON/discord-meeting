@@ -1,6 +1,7 @@
 import mongoose, { Document, Schema } from 'mongoose';
 
 export type MeetingStatus = 'scheduled' | 'active' | 'completed' | 'cancelled';
+export type MeetingType = 'immediate' | 'oneoff' | 'recurring';
 
 export interface IParticipant {
   userId: string;
@@ -9,10 +10,12 @@ export interface IParticipant {
   leaveTime?: Date;
   isLateJoiner: boolean;
   isEarlyLeaver: boolean;
+  isAbsent: boolean;
 }
 
 export interface IMeeting extends Document {
   title: string;
+  type: MeetingType;
   scheduledTime: Date;
   startTime?: Date;
   endTime?: Date;
@@ -30,11 +33,18 @@ const ParticipantSchema = new Schema<IParticipant>({
   leaveTime: { type: Date },
   isLateJoiner: { type: Boolean, default: false },
   isEarlyLeaver: { type: Boolean, default: false },
+  isAbsent: { type: Boolean, default: false },
 });
 
 const MeetingSchema = new Schema<IMeeting>(
   {
     title: { type: String, required: true },
+    type: {
+      type: String,
+      enum: ['immediate', 'oneoff', 'recurring'],
+      required: true,
+      default: 'immediate',
+    },
     scheduledTime: { type: Date, required: true },
     startTime: { type: Date },
     endTime: { type: Date },

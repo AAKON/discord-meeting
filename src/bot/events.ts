@@ -1,308 +1,448 @@
 import {
   ChatInputCommandInteraction,
-  GuildMember,
+  PermissionFlagsBits,
   TextChannel,
-  VoiceState,
 } from 'discord.js';
-import { joinVoiceChannel, VoiceConnectionStatus, entersState, VoiceConnection } from '@discordjs/voice';
+import { VoiceConnection } from '@discordjs/voice';
 import { client } from './index';
-import { config } from '../config';
 import { Meeting } from '../db/models/meeting';
 import { TranscriptEntry } from '../db/models/transcript';
 import { Task } from '../db/models/task';
-import { startVoiceCapture, stopVoiceCapture, stopUserCapture } from '../voice/capture';
-import { summarizeMeeting } from '../transcription/summarize';
-import { extractTasksFromMeeting, getTasksByAssignee } from '../transcription/tasks';
+import { GuildConfig } from '../db/models/guildConfig';
+import { GuildNotConfiguredError, requireGuildConfig } from './guards';
+import { restartGuildScheduler, scheduleOneOffMeeting } from '../scheduler/cron';
+import { meetingState } from './meetingState';
+import { runMeetingStart, runMeetingEnd } from './meetingRunner';
+import { handleApproveButton, handleEditButton, handleAdminEditMessage } from './approval';
+import { getTextChannel } from '../utils/discord';
 import { sendLongMessage } from './utils';
-import { transcriptionQueue } from '../queue';
-import { waitForQueueDrain } from '../utils/queue';
+import { getTasksByAssignee } from '../transcription/tasks';
 import mongoose from 'mongoose';
 
-let activeMeetingId: string | null = null;
-let activeConnection: VoiceConnection | null = null;
-let earlyLeaverListener: ((o: VoiceState, n: VoiceState) => void) | null = null;
+// ── Shims for index.ts reconnect logic — fully replaced in Step 11 ──────────
+export function getActiveMeetingId(): string | null { return null; }
+export function getActiveConnection(): VoiceConnection | null { return null; }
+export function setActiveConnection(_c: VoiceConnection | null): void { /* Step 11 */ }
 
-export function getActiveMeetingId(): string | null { return activeMeetingId; }
-export function getActiveConnection(): VoiceConnection | null { return activeConnection; }
-export function setActiveConnection(c: VoiceConnection | null): void { activeConnection = c; }
+// ── /setup ───────────────────────────────────────────────────────────────────
 
-async function getTextChannel(): Promise<TextChannel> {
-  const ch = await client.channels.fetch(config.MEETING_TEXT_CHANNEL_ID);
-  if (!ch || !ch.isTextBased()) throw new Error('Text channel not found');
-  return ch as TextChannel;
-}
+async function handleSetup(interaction: ChatInputCommandInteraction): Promise<void> {
+  await interaction.deferReply({ ephemeral: true });
 
-function buildParticipantMap(guildId: string): Map<string, string> {
-  const guild = client.guilds.cache.get(guildId);
-  const map = new Map<string, string>();
-  if (!guild) return map;
-  const voiceChannel = guild.channels.cache.get(config.MEETING_VOICE_CHANNEL_ID);
-  if (!voiceChannel || !voiceChannel.isVoiceBased()) return map;
-  voiceChannel.members.forEach((member: GuildMember) => {
-    map.set(member.id, member.displayName);
-  });
-  return map;
-}
+  if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+    await interaction.editReply('Only server admins can run `/setup`.');
+    return;
+  }
 
-async function handleStartMeeting(interaction: ChatInputCommandInteraction): Promise<void> {
-  await interaction.deferReply();
+  const voiceChannel = interaction.options.getChannel('voice-channel', true);
+  const textChannel  = interaction.options.getChannel('text-channel', true);
+  const meetingTime  = interaction.options.getString('meeting-time', true);
+  const timezone     = interaction.options.getString('timezone', true);
+  const duration     = interaction.options.getInteger('duration') ?? 30;
+  const reminder     = interaction.options.getInteger('reminder') ?? 5;
 
-  const meeting = await Meeting.create({
-    title: 'Manual Meeting',
-    scheduledTime: new Date(),
-    startTime: new Date(),
-    guildId: interaction.guildId!,
-    voiceChannelId: config.MEETING_VOICE_CHANNEL_ID,
-    textChannelId: config.MEETING_TEXT_CHANNEL_ID,
-    status: 'active',
-  });
+  if (!/^\d{2}:\d{2}$/.test(meetingTime)) {
+    await interaction.editReply('Invalid time format. Use HH:MM (e.g. `10:00`).');
+    return;
+  }
 
-  activeMeetingId = meeting._id.toString();
+  try {
+    Intl.DateTimeFormat(undefined, { timeZone: timezone });
+  } catch {
+    await interaction.editReply(
+      `Invalid timezone: \`${timezone}\`. Use an IANA timezone (e.g. \`Asia/Dhaka\`, \`UTC\`, \`America/New_York\`).`
+    );
+    return;
+  }
 
-  const guild = interaction.guild!;
-  const connection = joinVoiceChannel({
-    channelId: config.MEETING_VOICE_CHANNEL_ID,
-    guildId: guild.id,
-    adapterCreator: guild.voiceAdapterCreator,
-    selfDeaf: false,
-  });
+  const guild     = interaction.guild!;
+  const botMember = guild.members.me;
+  if (!botMember) {
+    await interaction.editReply('Could not verify bot permissions.');
+    return;
+  }
 
-  await entersState(connection, VoiceConnectionStatus.Ready, 10_000);
-  activeConnection = connection;
+  const vc = guild.channels.cache.get(voiceChannel.id);
+  const tc = guild.channels.cache.get(textChannel.id);
 
-  const textChannel = await getTextChannel();
-  const meetingIdForCapture = activeMeetingId;
+  if (!vc || !botMember.permissionsIn(vc).has([PermissionFlagsBits.Connect, PermissionFlagsBits.Speak])) {
+    await interaction.editReply(`Bot is missing **Connect** or **Speak** in <#${voiceChannel.id}>.`);
+    return;
+  }
+  if (!tc || !botMember.permissionsIn(tc).has(PermissionFlagsBits.SendMessages)) {
+    await interaction.editReply(`Bot is missing **Send Messages** in <#${textChannel.id}>.`);
+    return;
+  }
 
-  earlyLeaverListener = (oldState: VoiceState, newState: VoiceState) => {
-    if (!activeMeetingId) return;
-    if (oldState.channelId !== config.MEETING_VOICE_CHANNEL_ID) return;
-    if (newState.channelId === config.MEETING_VOICE_CHANNEL_ID) return;
-    if (newState.id === client.user?.id) return;
-    const displayName = oldState.member?.displayName ?? newState.id;
-    stopUserCapture(meetingIdForCapture!, newState.id).catch(console.error);
-    textChannel.send(`⚠️ **${displayName}** left the meeting early.`).catch(console.error);
-  };
-  client.on('voiceStateUpdate', earlyLeaverListener);
-
-  const participants = buildParticipantMap(guild.id);
-  startVoiceCapture(connection, activeMeetingId, participants, {
-    resolveDisplayName: (userId) =>
-      guild.members.cache.get(userId)?.displayName ?? userId,
-    onLateJoiner: (_, displayName) => {
-      textChannel.send(`🕐 **${displayName}** joined late.`).catch(console.error);
+  const guildConfig = await GuildConfig.findOneAndUpdate(
+    { guildId: interaction.guildId! },
+    {
+      guildId: interaction.guildId!,
+      voiceChannelId: voiceChannel.id,
+      textChannelId: textChannel.id,
+      timezone,
+      adminUserId: interaction.user.id,
+      meetingTime,
+      meetingDurationMinutes: duration,
+      reminderMinutesBefore: reminder,
+      isActive: true,
     },
-  });
+    { upsert: true, new: true }
+  );
 
-  await textChannel.send('🔴 Meeting started. Recording...');
-  await interaction.editReply('Meeting started.');
+  restartGuildScheduler(guildConfig);
+
+  console.log(`[setup] Guild ${interaction.guildId} configured by ${interaction.user.tag}`);
+  await interaction.editReply(
+    `**StandupBot configured!**\n` +
+    `• Voice: <#${voiceChannel.id}>\n` +
+    `• Text: <#${textChannel.id}>\n` +
+    `• Daily standup: **${meetingTime}** (${timezone})\n` +
+    `• Duration: **${duration} min** | Reminder: **${reminder} min** before`
+  );
 }
 
-async function handleEndMeeting(interaction: ChatInputCommandInteraction): Promise<void> {
-  await interaction.deferReply();
+// ── /config show ─────────────────────────────────────────────────────────────
 
-  if (!activeMeetingId) {
-    await interaction.editReply('No active meeting.');
-    return;
-  }
+async function handleConfigShow(interaction: ChatInputCommandInteraction): Promise<void> {
+  await interaction.deferReply({ ephemeral: true });
 
-  const meetingId = activeMeetingId;
-  activeMeetingId = null;
-
-  if (earlyLeaverListener) {
-    client.off('voiceStateUpdate', earlyLeaverListener);
-    earlyLeaverListener = null;
-  }
-
-  await stopVoiceCapture(meetingId);
-
-  activeConnection?.destroy();
-  activeConnection = null;
-
-  const endTime = new Date();
-  await Meeting.findByIdAndUpdate(meetingId, { status: 'completed', endTime });
-
-  await waitForQueueDrain(transcriptionQueue);
-
-  const entries = await TranscriptEntry.find({ meetingId }).sort({ startTimestamp: 1 });
-
-  const textChannel = await getTextChannel();
-  if (entries.length) {
-    const transcript = entries.map((e) => `**${e.displayName}**: ${e.text}`).join('\n');
-    await sendLongMessage(textChannel, transcript, '📝 **Conversation**\n');
-
-    // Extract and display tasks
-    await extractTasksFromMeeting(meetingId, entries);
-    const tasksByAssignee = await getTasksByAssignee(meetingId);
-
-    if (tasksByAssignee.size > 0) {
-      let tasksMessage = '📋 **Task Assignments**\n\n';
-      for (const [assignee, tasks] of tasksByAssignee) {
-        tasksMessage += `👤 **${assignee}**\n`;
-        for (const task of tasks) {
-          tasksMessage += `  • ${task.title}`;
-          if (task.description) {
-            tasksMessage += ` - ${task.description}`;
-          }
-          tasksMessage += '\n';
-        }
-        tasksMessage += '\n';
-      }
-      await textChannel.send(tasksMessage);
-    }
-
-    const summary = await summarizeMeeting(entries);
-    await sendLongMessage(textChannel, summary, '📋 **Summary**\n');
-  } else {
-    await textChannel.send('No speech recorded.');
-  }
-  await textChannel.send('✅ Meeting ended.');
-  await interaction.editReply('Meeting ended.');
-}
-
-async function handleMeetingSummary(interaction: ChatInputCommandInteraction): Promise<void> {
-  await interaction.deferReply();
-
-  const meeting = await Meeting.findOne({ status: 'completed' }).sort({ endTime: -1 });
-  if (!meeting) {
-    await interaction.editReply('No completed meetings found.');
-    return;
-  }
-
-  const entries = await TranscriptEntry.find({ meetingId: meeting._id }).sort({ startTimestamp: 1 });
-  if (!entries.length) {
-    await interaction.editReply('No transcript for the latest meeting.');
-    return;
-  }
-
-  const transcript = entries.map((e) => `**${e.displayName}**: ${e.text}`).join('\n');
-  const textChannel = await getTextChannel();
-  await sendLongMessage(textChannel, transcript, `📝 **Summary — ${meeting.title}**\n`);
-  await interaction.editReply('Summary posted.');
-}
-
-async function handleAttendance(interaction: ChatInputCommandInteraction): Promise<void> {
-  await interaction.deferReply();
-
-  const meeting = await Meeting.findOne({ status: 'completed' }).sort({ endTime: -1 });
-  if (!meeting) {
-    await interaction.editReply('No completed meetings found.');
-    return;
-  }
-
-  const speakers = await TranscriptEntry.distinct('displayName', { meetingId: meeting._id });
-  if (!speakers.length) {
-    await interaction.editReply('No attendance data.');
+  const cfg = await GuildConfig.findOne({ guildId: interaction.guildId!, isActive: true });
+  if (!cfg) {
+    await interaction.editReply('Not configured yet. Run `/setup` to get started.');
     return;
   }
 
   await interaction.editReply(
-    `👥 **Attendance — ${meeting.title}**\n${speakers.map((s: string) => `• ${s}`).join('\n')}`
+    `**StandupBot Config**\n` +
+    `• Voice: <#${cfg.voiceChannelId}>\n` +
+    `• Text: <#${cfg.textChannelId}>\n` +
+    `• Standup: **${cfg.meetingTime}** (${cfg.timezone})\n` +
+    `• Duration: **${cfg.meetingDurationMinutes} min** | Reminder: **${cfg.reminderMinutesBefore} min** before\n` +
+    `• Admin: <@${cfg.adminUserId}>`
   );
 }
 
+// ── /start-meeting ────────────────────────────────────────────────────────────
+
+async function handleStartMeeting(interaction: ChatInputCommandInteraction): Promise<void> {
+  await interaction.deferReply();
+  const cfg = await requireGuildConfig(interaction.guildId!);
+
+  if (meetingState.has(cfg.guildId)) {
+    await interaction.editReply('A meeting is already active.');
+    return;
+  }
+
+  await runMeetingStart(cfg, { title: 'Standup', type: 'immediate' });
+  await interaction.editReply('Meeting started.');
+}
+
+// ── /schedule-meeting ─────────────────────────────────────────────────────────
+
+async function handleScheduleMeeting(interaction: ChatInputCommandInteraction): Promise<void> {
+  await interaction.deferReply();
+  const cfg = await requireGuildConfig(interaction.guildId!);
+
+  const title          = interaction.options.getString('title', true);
+  const date           = interaction.options.getString('date', true);
+  const time           = interaction.options.getString('time', true);
+  const participantRaw = interaction.options.getString('participants');
+
+  const scheduledTime = new Date(`${date}T${time}:00`);
+  if (isNaN(scheduledTime.getTime()) || scheduledTime <= new Date()) {
+    await interaction.editReply('Invalid date/time, or the time is in the past.');
+    return;
+  }
+
+  const participantIds: string[] = [];
+  if (participantRaw) {
+    const re = /<@!?(\d+)>/g;
+    let m;
+    while ((m = re.exec(participantRaw)) !== null) participantIds.push(m[1]);
+  }
+
+  const guild        = interaction.guild!;
+  const participants = participantIds.map((id) => ({
+    userId: id,
+    displayName: guild.members.cache.get(id)?.displayName ?? id,
+    joinTime: scheduledTime,
+    isLateJoiner: false,
+    isEarlyLeaver: false,
+    isAbsent: false,
+  }));
+
+  const meeting = await Meeting.create({
+    title,
+    type: 'oneoff',
+    scheduledTime,
+    guildId: cfg.guildId,
+    voiceChannelId: cfg.voiceChannelId,
+    textChannelId: cfg.textChannelId,
+    status: 'scheduled',
+    participants,
+  });
+
+  scheduleOneOffMeeting(meeting, cfg);
+
+  const formatted = scheduledTime.toLocaleString('en-US', {
+    timeZone: cfg.timezone,
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  });
+
+  await interaction.editReply(
+    `📅 **Meeting scheduled!**\n` +
+    `• Title: **${title}**\n` +
+    `• Time: **${formatted}** (${cfg.timezone})\n` +
+    `• ID: \`${meeting._id}\`` +
+    (participants.length ? `\n• Participants: ${participantIds.map((id) => `<@${id}>`).join(' ')}` : '')
+  );
+}
+
+// ── /end-meeting ──────────────────────────────────────────────────────────────
+
+async function handleEndMeeting(interaction: ChatInputCommandInteraction): Promise<void> {
+  await interaction.deferReply();
+  const cfg = await requireGuildConfig(interaction.guildId!);
+
+  if (!meetingState.has(cfg.guildId)) {
+    await interaction.editReply('No active meeting.');
+    return;
+  }
+
+  await runMeetingEnd(cfg);
+  await interaction.editReply('Meeting ended.');
+}
+
+// ── /assign-task ──────────────────────────────────────────────────────────────
+
 async function handleAssignTask(interaction: ChatInputCommandInteraction): Promise<void> {
   await interaction.deferReply();
+  const cfg    = await requireGuildConfig(interaction.guildId!);
+  const active = meetingState.get(cfg.guildId);
 
-  const assignedTo = interaction.options.getString('assigned-to', true);
-  const title = interaction.options.getString('title', true);
-  const description = interaction.options.getString('description', false);
-
-  if (!activeMeetingId) {
+  if (!active) {
     await interaction.editReply('No active meeting. Start a meeting first.');
     return;
   }
 
-  const task = await Task.create({
-    meetingId: new mongoose.Types.ObjectId(activeMeetingId),
+  const assignedTo  = interaction.options.getString('assigned-to', true);
+  const title       = interaction.options.getString('title', true);
+  const description = interaction.options.getString('description');
+
+  await Task.create({
+    meetingId: new mongoose.Types.ObjectId(active.meetingId),
     assignedTo,
     title,
-    description: description || undefined,
+    description: description ?? undefined,
     status: 'assigned',
   });
 
-  const textChannel = await getTextChannel();
-  await textChannel.send(`📌 **Task Assigned**\n👤 **${assignedTo}**: ${title}${description ? `\n${description}` : ''}`);
-
-  await interaction.editReply('Task assigned successfully.');
+  const textChannel = await getTextChannel(cfg.textChannelId);
+  await textChannel.send(
+    `📌 **Task Assigned**\n👤 **${assignedTo}**: ${title}${description ? `\n${description}` : ''}`
+  );
+  await interaction.editReply('Task assigned.');
 }
+
+// ── /show-tasks ───────────────────────────────────────────────────────────────
 
 async function handleShowTasks(interaction: ChatInputCommandInteraction): Promise<void> {
   await interaction.deferReply();
+  const cfg = await requireGuildConfig(interaction.guildId!);
 
-  const meeting = await Meeting.findOne({ status: 'completed' }).sort({ endTime: -1 });
+  const meeting = await Meeting.findOne({ guildId: cfg.guildId, status: 'completed' }).sort({ endTime: -1 });
   if (!meeting) {
     await interaction.editReply('No completed meetings found.');
     return;
   }
 
   const tasksByAssignee = await getTasksByAssignee(meeting._id.toString());
-
   if (tasksByAssignee.size === 0) {
-    await interaction.editReply('No tasks found for the latest meeting.');
+    await interaction.editReply('No tasks for the latest meeting.');
     return;
   }
 
-  let tasksMessage = '📋 **Tasks — Latest Meeting**\n\n';
+  let msg = '📋 **Tasks — Latest Meeting**\n\n';
   for (const [assignee, tasks] of tasksByAssignee) {
-    tasksMessage += `👤 **${assignee}**\n`;
+    msg += `👤 **${assignee}**\n`;
     for (const task of tasks) {
-      tasksMessage += `  • ${task.title}`;
-      if (task.description) {
-        tasksMessage += ` - ${task.description}`;
-      }
-      tasksMessage += '\n';
+      msg += `  • ${task.title}${task.description ? ` — ${task.description}` : ''}\n`;
     }
-    tasksMessage += '\n';
+    msg += '\n';
   }
 
-  await interaction.editReply(tasksMessage);
+  await interaction.editReply(msg);
 }
 
-async function handleCreateMeeting(interaction: ChatInputCommandInteraction): Promise<void> {
+// ── /meeting-summary ──────────────────────────────────────────────────────────
+
+async function handleMeetingSummary(interaction: ChatInputCommandInteraction): Promise<void> {
   await interaction.deferReply();
+  const cfg = await requireGuildConfig(interaction.guildId!);
 
-  const title = interaction.options.getString('title', true);
-  const timeStr = interaction.options.getString('time', true);
-  const scheduledTime = new Date(timeStr);
-
-  if (isNaN(scheduledTime.getTime())) {
-    await interaction.editReply('Invalid time format. Use ISO 8601 or HH:MM.');
+  const meetingId = interaction.options.getString('meeting-id', true);
+  const meeting   = await Meeting.findOne({ _id: meetingId, guildId: cfg.guildId });
+  if (!meeting) {
+    await interaction.editReply('Meeting not found (or belongs to another server).');
     return;
   }
 
-  const meeting = await Meeting.create({
-    title,
-    scheduledTime,
-    guildId: interaction.guildId!,
-    voiceChannelId: config.MEETING_VOICE_CHANNEL_ID,
-    textChannelId: config.MEETING_TEXT_CHANNEL_ID,
-    status: 'scheduled',
+  const entries = await TranscriptEntry.find({ meetingId: meeting._id }).sort({ startTimestamp: 1 });
+  if (!entries.length) {
+    await interaction.editReply('No transcript for this meeting.');
+    return;
+  }
+
+  const transcript = entries.map((e) => `**${e.displayName}**: ${e.text}`).join('\n');
+  const textChannel = await getTextChannel(cfg.textChannelId);
+  await sendLongMessage(textChannel, transcript, `📝 **Transcript — ${meeting.title}**\n`);
+  await interaction.editReply('Transcript posted.');
+}
+
+// ── /attendance ───────────────────────────────────────────────────────────────
+
+async function handleAttendance(interaction: ChatInputCommandInteraction): Promise<void> {
+  await interaction.deferReply();
+  const cfg = await requireGuildConfig(interaction.guildId!);
+
+  const meetingId = interaction.options.getString('meeting-id', true);
+  const meeting   = await Meeting.findOne({ _id: meetingId, guildId: cfg.guildId });
+  if (!meeting) {
+    await interaction.editReply('Meeting not found (or belongs to another server).');
+    return;
+  }
+
+  const speakers = await TranscriptEntry.distinct('displayName', { meetingId: meeting._id });
+  if (!speakers.length) {
+    await interaction.editReply('No attendance data for this meeting.');
+    return;
+  }
+
+  let msg = `👥 **Attendance — ${meeting.title}**\n`;
+  speakers.forEach((s: string) => { msg += `• ${s}\n`; });
+
+  if (meeting.participants?.length) {
+    const late    = meeting.participants.filter((p) => p.isLateJoiner).map((p) => p.displayName);
+    const early   = meeting.participants.filter((p) => p.isEarlyLeaver).map((p) => p.displayName);
+    const absent  = meeting.participants.filter((p) => p.isAbsent).map((p) => p.displayName);
+    if (late.length)   msg += `\n⏰ Late: ${late.join(', ')}`;
+    if (early.length)  msg += `\n🚪 Left early: ${early.join(', ')}`;
+    if (absent.length) msg += `\n❌ Absent: ${absent.join(', ')}`;
+  }
+
+  await interaction.editReply(msg);
+}
+
+// ── /task-done ────────────────────────────────────────────────────────────────
+
+async function handleTaskDone(interaction: ChatInputCommandInteraction): Promise<void> {
+  await interaction.deferReply({ ephemeral: true });
+  const cfg    = await requireGuildConfig(interaction.guildId!);
+  const taskId = interaction.options.getString('task-id', true);
+
+  const task = await Task.findById(taskId).lean();
+  if (!task) {
+    await interaction.editReply('Task not found.');
+    return;
+  }
+
+  // Security: verify the task's meeting belongs to this guild
+  const meeting = await Meeting.findOne({ _id: task.meetingId, guildId: cfg.guildId });
+  if (!meeting) {
+    await interaction.editReply('Task not found (or belongs to another server).');
+    return;
+  }
+
+  await Task.findByIdAndUpdate(taskId, { status: 'completed' });
+  await interaction.editReply(`✅ Task marked complete: **${task.title}**`);
+}
+
+// ── /meeting-history ──────────────────────────────────────────────────────────
+
+async function handleMeetingHistory(interaction: ChatInputCommandInteraction): Promise<void> {
+  await interaction.deferReply();
+  const cfg = await requireGuildConfig(interaction.guildId!);
+
+  const meetings = await Meeting.find({ guildId: cfg.guildId })
+    .sort({ createdAt: -1 })
+    .limit(10)
+    .lean();
+
+  if (!meetings.length) {
+    await interaction.editReply('No meetings found for this server.');
+    return;
+  }
+
+  const statusIcon: Record<string, string> = {
+    completed: '✅',
+    active:    '🔴',
+    scheduled: '📅',
+    cancelled: '❌',
+  };
+
+  const typeLabel: Record<string, string> = {
+    immediate: 'manual',
+    oneoff:    'one-off',
+    recurring: 'daily',
+  };
+
+  let msg = '📋 **Meeting History**\n\n';
+  meetings.forEach((m, i) => {
+    const date = (m.startTime ?? m.scheduledTime).toLocaleString('en-US', {
+      month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+    });
+    const icon  = statusIcon[m.status]  ?? '❓';
+    const label = typeLabel[m.type]     ?? m.type;
+    msg += `**${i + 1}.** ${icon} ${m.title} — ${date} — ${label}\n`;
+    msg += `    \`ID: ${m._id}\`\n`;
   });
 
-  await interaction.editReply(`Meeting "${title}" created (ID: ${meeting._id}).`);
+  await interaction.editReply(msg);
 }
 
+// ── Event registration ────────────────────────────────────────────────────────
+
 export function registerEvents(): void {
+  // Slash command handler
   client.on('interactionCreate', async (interaction) => {
+    if (interaction.isButton()) {
+      const [action, meetingId] = interaction.customId.split('_');
+      if (action === 'approve') await handleApproveButton(interaction, meetingId).catch(console.error);
+      if (action === 'edit')    await handleEditButton(interaction, meetingId).catch(console.error);
+      return;
+    }
+
     if (!interaction.isChatInputCommand()) return;
 
     try {
       switch (interaction.commandName) {
-        case 'create-meeting': await handleCreateMeeting(interaction); break;
-        case 'start-meeting':  await handleStartMeeting(interaction);  break;
-        case 'end-meeting':    await handleEndMeeting(interaction);    break;
-        case 'meeting-summary': await handleMeetingSummary(interaction); break;
-        case 'attendance':     await handleAttendance(interaction);    break;
-        case 'assign-task':    await handleAssignTask(interaction);    break;
-        case 'show-tasks':     await handleShowTasks(interaction);     break;
+        case 'setup':             await handleSetup(interaction);           break;
+        case 'config':            await handleConfigShow(interaction);      break;
+        case 'start-meeting':     await handleStartMeeting(interaction);    break;
+        case 'schedule-meeting':  await handleScheduleMeeting(interaction); break;
+        case 'end-meeting':       await handleEndMeeting(interaction);      break;
+        case 'assign-task':       await handleAssignTask(interaction);      break;
+        case 'show-tasks':        await handleShowTasks(interaction);       break;
+        case 'meeting-summary':   await handleMeetingSummary(interaction);   break;
+        case 'attendance':        await handleAttendance(interaction);       break;
+        case 'task-done':         await handleTaskDone(interaction);         break;
+        case 'meeting-history':   await handleMeetingHistory(interaction);   break;
       }
     } catch (err) {
-      console.error(`[events] Command error:`, err);
-      const msg = 'An error occurred.';
+      console.error('[events] Command error:', err);
+      const msg = err instanceof GuildNotConfiguredError
+        ? err.message
+        : 'An error occurred.';
       if (interaction.deferred) await interaction.editReply(msg);
       else await interaction.reply({ content: msg, ephemeral: true });
     }
   });
-}
 
-export { activeMeetingId };
+  // DM message handler — captures admin's edited summary after "Edit then Approve"
+  client.on('messageCreate', async (message) => {
+    if (message.author.bot || message.guild) return; // only DMs
+    await handleAdminEditMessage(message).catch(console.error);
+  });
+}

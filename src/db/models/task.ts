@@ -8,6 +8,7 @@ export interface ITask extends Document {
   dueDate?: Date;
   status: 'assigned' | 'in_progress' | 'completed' | 'pending';
   assignedBy?: string;
+  approvedByAdmin: boolean;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -25,6 +26,7 @@ const TaskSchema = new Schema<ITask>(
       default: 'assigned',
     },
     assignedBy: { type: String },
+    approvedByAdmin: { type: Boolean, default: false },
   },
   { timestamps: true }
 );

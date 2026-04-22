@@ -29,13 +29,14 @@ export async function extractTasksFromMeeting(
           role: 'user',
           content: `Extract all task assignments from this meeting conversation. The conversation may be in Bangla, English, or mixed.
 
-For each task, identify:
-1. Who the task is assigned to (person's name or "unassigned")
-2. The task title/description
+Rules:
+1. "assignedTo" — use the EXACT name as spoken in the conversation, do NOT translate
+2. "title" — ALWAYS write in English; translate from Bangla if needed
+3. "description" — ALWAYS write in English; translate from Bangla if needed; omit if not present
 
-Return ONLY a JSON array with this format:
+Return ONLY a JSON array with this exact format:
 [
-  {"assignedTo": "Person Name", "title": "Task title", "description": "optional details"},
+  {"assignedTo": "Person Name", "title": "Task title in English", "description": "optional details in English"},
   ...
 ]
 
