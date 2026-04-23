@@ -9,14 +9,14 @@ const commands = [
       opt
         .setName('voice-channel')
         .setDescription('Voice channel the bot joins for meetings')
-        .addChannelTypes(ChannelType.GuildVoice)
+        .addChannelTypes(ChannelType.GuildVoice, ChannelType.GuildStageVoice)
         .setRequired(true)
     )
     .addChannelOption((opt) =>
       opt
         .setName('text-channel')
         .setDescription('Text channel where transcripts are posted')
-        .addChannelTypes(ChannelType.GuildText)
+        .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
         .setRequired(true)
     )
     .addStringOption((opt) =>

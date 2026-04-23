@@ -35,6 +35,7 @@ export function setActiveConnection(_c: VoiceConnection | null): void { /* Step 
 // ── /setup ───────────────────────────────────────────────────────────────────
 
 async function handleSetup(interaction: ChatInputCommandInteraction): Promise<void> {
+  console.log(`[setup] Interaction from ${interaction.user.tag} in guild ${interaction.guildId}`);
   await interaction.deferReply({ ephemeral: true });
 
   if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
