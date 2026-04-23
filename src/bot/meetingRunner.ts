@@ -6,7 +6,7 @@ import { Meeting, MeetingType } from '../db/models/meeting';
 import { TranscriptEntry } from '../db/models/transcript';
 import { startVoiceCapture, stopVoiceCapture, stopUserCapture } from '../voice/capture';
 import { summarizeMeeting } from '../transcription/summarize';
-import { extractTasksFromMeeting, getTasksByAssignee } from '../transcription/tasks';
+import { extractTasksFromMeeting } from '../transcription/tasks';
 import { sendLongMessage } from './utils';
 import { transcriptionQueue } from '../queue';
 import { waitForQueueDrain } from '../utils/queue';
@@ -165,10 +165,9 @@ export async function runMeetingEnd(cfg: IGuildConfig): Promise<void> {
 
   // Run AI pipeline, then hand off to approval workflow
   await extractTasksFromMeeting(meetingId, entries);
-  const tasksByAssignee = await getTasksByAssignee(meetingId);
-  const summary         = await summarizeMeeting(entries);
+  const summary = await summarizeMeeting(entries);
 
-  await startApprovalWorkflow(meetingId, cfg, summary, tasksByAssignee);
+  await startApprovalWorkflow(meetingId, cfg, summary);
 
   console.log(`[runner] Meeting ${meetingId} ended, awaiting admin approval`);
 }

@@ -13,7 +13,15 @@ import { GuildNotConfiguredError, requireGuildConfig } from './guards';
 import { restartGuildScheduler, scheduleOneOffMeeting } from '../scheduler/cron';
 import { meetingState } from './meetingState';
 import { runMeetingStart, runMeetingEnd } from './meetingRunner';
-import { handleApproveButton, handleEditButton, handleAdminEditMessage } from './approval';
+import {
+  handleAdminDmMessage,
+  handleDispatchButton,
+  handleEditSummaryButton,
+  handleEditTaskButton,
+  handleSkipTaskButton,
+  handleTaskAssignSelect,
+  handleTaskModalSubmit,
+} from './approval';
 import { getTextChannel } from '../utils/discord';
 import { sendLongMessage } from './utils';
 import { getTasksByAssignee } from '../transcription/tasks';
@@ -408,9 +416,23 @@ export function registerEvents(): void {
   // Slash command handler
   client.on('interactionCreate', async (interaction) => {
     if (interaction.isButton()) {
-      const [action, meetingId] = interaction.customId.split('_');
-      if (action === 'approve') await handleApproveButton(interaction, meetingId).catch(console.error);
-      if (action === 'edit')    await handleEditButton(interaction, meetingId).catch(console.error);
+      const [action, id] = interaction.customId.split('_');
+      if (action === 'editsummary')  await handleEditSummaryButton(interaction, id).catch(console.error);
+      if (action === 'edittask')     await handleEditTaskButton(interaction, id).catch(console.error);
+      if (action === 'skiptask')     await handleSkipTaskButton(interaction, id).catch(console.error);
+      if (action === 'dispatchtasks') await handleDispatchButton(interaction, id).catch(console.error);
+      return;
+    }
+
+    if (interaction.isUserSelectMenu()) {
+      const [action, id] = interaction.customId.split('_');
+      if (action === 'assigntask') await handleTaskAssignSelect(interaction, id).catch(console.error);
+      return;
+    }
+
+    if (interaction.isModalSubmit()) {
+      const [action, id] = interaction.customId.split('_');
+      if (action === 'taskmodal') await handleTaskModalSubmit(interaction, id).catch(console.error);
       return;
     }
 
@@ -440,9 +462,9 @@ export function registerEvents(): void {
     }
   });
 
-  // DM message handler — captures admin's edited summary after "Edit then Approve"
+  // DM message handler — captures admin's edited summary
   client.on('messageCreate', async (message) => {
     if (message.author.bot || message.guild) return; // only DMs
-    await handleAdminEditMessage(message).catch(console.error);
+    await handleAdminDmMessage(message).catch(console.error);
   });
 }

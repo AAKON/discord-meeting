@@ -3,8 +3,14 @@ import {
   ButtonBuilder,
   ButtonInteraction,
   ButtonStyle,
-  DMChannel,
+  EmbedBuilder,
   Message,
+  ModalBuilder,
+  ModalSubmitInteraction,
+  TextInputBuilder,
+  TextInputStyle,
+  UserSelectMenuBuilder,
+  UserSelectMenuInteraction,
 } from 'discord.js';
 import { client } from './index';
 import { GuildConfig, IGuildConfig } from '../db/models/guildConfig';
@@ -14,23 +20,58 @@ import { Meeting } from '../db/models/meeting';
 import { getTextChannel } from '../utils/discord';
 import { sendLongMessage } from './utils';
 
-interface TaskItem {
-  title: string;
-  description?: string;
+// adminUserId → meetingId (waiting for summary edit DM reply)
+const pendingSummaryEdits = new Map<string, string>();
+
+// ── Task card builder ─────────────────────────────────────────────────────────
+
+function buildTaskCard(
+  taskId: string,
+  title: string,
+  description: string | undefined,
+  suggestedName: string,
+  state: 'pending' | 'assigned' | 'skipped',
+  assignedDiscordId?: string,
+) {
+  const assignedValue =
+    state === 'assigned' && assignedDiscordId
+      ? `<@${assignedDiscordId}>`
+      : state === 'skipped'
+      ? '⏭️ Skipped'
+      : '— not yet assigned —';
+
+  const embed = new EmbedBuilder()
+    .setTitle('📌 Task Assignment')
+    .addFields(
+      { name: 'Title', value: title },
+      { name: 'Description', value: description || '—' },
+      { name: 'AI Suggested', value: suggestedName, inline: true },
+      { name: 'Assigned To', value: assignedValue, inline: true },
+    )
+    .setColor(state === 'assigned' ? 0x57f287 : state === 'skipped' ? 0x95a5a6 : 0x5865f2);
+
+  const selectRow = new ActionRowBuilder<UserSelectMenuBuilder>().addComponents(
+    new UserSelectMenuBuilder()
+      .setCustomId(`assigntask_${taskId}`)
+      .setPlaceholder('Select member to assign')
+      .setDisabled(state !== 'pending'),
+  );
+
+  const btnRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`edittask_${taskId}`)
+      .setLabel('✏️ Edit Task')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(state === 'skipped'),
+    new ButtonBuilder()
+      .setCustomId(`skiptask_${taskId}`)
+      .setLabel('⏭️ Skip')
+      .setStyle(ButtonStyle.Danger)
+      .setDisabled(state === 'skipped'),
+  );
+
+  return { embeds: [embed], components: [selectRow, btnRow] };
 }
-
-interface ReassignItem {
-  taskId: string;
-  assignedTo: string;
-  taskMsg: string;
-  cfg: IGuildConfig;
-}
-
-// adminUserId → meetingId, held between button click and follow-up DM message
-const pendingEdits = new Map<string, string>();
-
-// adminUserId → queue of unmatched tasks waiting for admin to specify the correct member
-const pendingReassignments = new Map<string, ReassignItem[]>();
 
 // ── Start workflow ────────────────────────────────────────────────────────────
 
@@ -38,7 +79,6 @@ export async function startApprovalWorkflow(
   meetingId: string,
   cfg: IGuildConfig,
   summary: string,
-  tasksByAssignee: Map<string, TaskItem[]>
 ): Promise<void> {
   let adminUser;
   try {
@@ -48,258 +88,259 @@ export async function startApprovalWorkflow(
     return;
   }
 
-  let taskBlock = '';
-  if (tasksByAssignee.size > 0) {
-    taskBlock = '\n\n**Tasks:**\n';
-    for (const [assignee, tasks] of tasksByAssignee) {
-      taskBlock += `👤 **${assignee}**\n`;
-      for (const t of tasks) {
-        taskBlock += `  • ${t.title}${t.description ? ` — ${t.description}` : ''}\n`;
-      }
-    }
-  }
+  const tasks = await Task.find({ meetingId }).lean();
+  const dm = await adminUser.createDM();
 
-  const content =
-    `📋 **Meeting Summary — Approval Required**\n\n` +
-    `${summary}${taskBlock}\n\n` +
-    `Approve to dispatch tasks to assignees, or edit the summary first.`;
+  // Summary card
+  const summaryEmbed = new EmbedBuilder()
+    .setTitle('📋 Meeting Summary')
+    .setDescription(summary.slice(0, 4096))
+    .setColor(0x5865f2);
 
-  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+  const summaryRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
-      .setCustomId(`approve_${meetingId}`)
-      .setLabel('✅ Approve')
-      .setStyle(ButtonStyle.Success),
-    new ButtonBuilder()
-      .setCustomId(`edit_${meetingId}`)
-      .setLabel('✏️ Edit then Approve')
-      .setStyle(ButtonStyle.Secondary)
+      .setCustomId(`editsummary_${meetingId}`)
+      .setLabel('✏️ Edit Summary')
+      .setStyle(ButtonStyle.Secondary),
   );
 
-  const dm       = await adminUser.createDM();
-  const adminMsg = await dm.send({ content, components: [row] });
+  await dm.send({ embeds: [summaryEmbed], components: [summaryRow] });
+
+  // One task card per task
+  for (const task of tasks) {
+    await dm.send(buildTaskCard(task._id.toString(), task.title, task.description, task.assignedTo, 'pending'));
+  }
+
+  // Dispatch button
+  const dispatchRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`dispatchtasks_${meetingId}`)
+      .setLabel('🚀 Dispatch Assigned Tasks')
+      .setStyle(ButtonStyle.Primary),
+  );
+  await dm.send({
+    content: tasks.length
+      ? '📬 Assign members above, then click to dispatch when ready.'
+      : '📬 No tasks extracted. Click to post summary and finalize.',
+    components: [dispatchRow],
+  });
 
   await ApprovalRequest.create({
     meetingId,
     adminUserId: cfg.adminUserId,
-    adminMessageId: adminMsg.id,
+    adminMessageId: '—',
     originalSummary: summary,
     status: 'pending',
     sentToAdminAt: new Date(),
   });
 
   const textChannel = await getTextChannel(cfg.textChannelId);
-  await textChannel.send('📬 Summary sent to admin for review. Tasks dispatched after approval.');
+  await textChannel.send('📬 Meeting summary sent to admin for task assignment.');
   console.log(`[approval] Workflow started for meeting ${meetingId}`);
 }
 
-// ── Button: Approve ───────────────────────────────────────────────────────────
+// ── UserSelectMenu: assign task ───────────────────────────────────────────────
 
-export async function handleApproveButton(
-  interaction: ButtonInteraction,
-  meetingId: string
+export async function handleTaskAssignSelect(
+  interaction: UserSelectMenuInteraction,
+  taskId: string,
 ): Promise<void> {
   await interaction.deferUpdate();
 
-  const approval = await ApprovalRequest.findOne({ meetingId, status: 'pending' });
-  if (!approval) {
-    await interaction.followUp({ content: 'Request not found or already processed.', ephemeral: true });
-    return;
-  }
+  const discordUserId = interaction.values[0];
+  const task = await Task.findById(taskId).lean();
+  if (!task) return;
 
-  const meeting = await Meeting.findById(meetingId);
+  const meeting = await Meeting.findById(task.meetingId).lean();
   if (!meeting) return;
 
-  const cfg = await GuildConfig.findOne({ guildId: meeting.guildId, isActive: true });
-  if (!cfg) return;
-
-  const summaryToPost = approval.editedSummary ?? approval.originalSummary;
-
-  await ApprovalRequest.findByIdAndUpdate(approval._id, { status: 'approved', approvedAt: new Date() });
-  await Task.updateMany({ meetingId }, { approvedByAdmin: true });
-
-  const textChannel = await getTextChannel(cfg.textChannelId);
-  await sendLongMessage(textChannel, summaryToPost, '📋 **Summary**\n');
-  await dispatchTasksToAssignees(meetingId, cfg);
-  await textChannel.send('✅ Meeting ended.');
-
-  await interaction.editReply({ content: '✅ Approved. Tasks dispatched.', components: [] });
-  console.log(`[approval] Meeting ${meetingId} approved`);
-}
-
-// ── Button: Edit then Approve ─────────────────────────────────────────────────
-
-export async function handleEditButton(
-  interaction: ButtonInteraction,
-  meetingId: string
-): Promise<void> {
-  await interaction.deferUpdate();
-  pendingEdits.set(interaction.user.id, meetingId);
-  await interaction.editReply({
-    content: '✏️ Send your edited summary as the next message in this DM.',
-    components: [],
-  });
-}
-
-// ── DM message handler — routes to edit or reassignment flow ──────────────────
-
-export async function handleAdminEditMessage(message: Message): Promise<void> {
-  // Priority 1: summary edit flow
-  const meetingId = pendingEdits.get(message.author.id);
-  if (meetingId) {
-    pendingEdits.delete(message.author.id);
-    await processSummaryEdit(message, meetingId);
-    return;
-  }
-
-  // Priority 2: task reassignment flow
-  const queue = pendingReassignments.get(message.author.id);
-  if (queue?.length) {
-    await processReassignmentReply(message, queue);
-    return;
-  }
-}
-
-async function processSummaryEdit(message: Message, meetingId: string): Promise<void> {
-  const approval = await ApprovalRequest.findOne({
-    meetingId,
-    adminUserId: message.author.id,
-    status: 'pending',
-  });
-  if (!approval) return;
-
-  const meeting = await Meeting.findById(meetingId);
-  if (!meeting) return;
-
-  const cfg = await GuildConfig.findOne({ guildId: meeting.guildId, isActive: true });
-  if (!cfg) return;
-
-  await ApprovalRequest.findByIdAndUpdate(approval._id, {
-    editedSummary: message.content,
-    status: 'approved',
-    approvedAt: new Date(),
-  });
-  await Task.updateMany({ meetingId }, { approvedByAdmin: true });
-
-  const textChannel = await getTextChannel(cfg.textChannelId);
-  await sendLongMessage(textChannel, message.content, '📋 **Summary**\n');
-  await dispatchTasksToAssignees(meetingId, cfg);
-  await textChannel.send('✅ Meeting ended.');
-
-  await message.reply('✅ Summary saved and tasks dispatched.');
-  console.log(`[approval] Meeting ${meetingId} approved with edited summary`);
-}
-
-// ── Dispatch tasks to assignees ───────────────────────────────────────────────
-
-export async function dispatchTasksToAssignees(
-  meetingId: string,
-  cfg: IGuildConfig
-): Promise<void> {
-  const tasks = await Task.find({ meetingId, approvedByAdmin: true }).lean();
-  if (!tasks.length) return;
-
-  const guild = client.guilds.cache.get(cfg.guildId);
-
-  // Populate member cache for accurate matching
-  try { await guild?.members.fetch(); } catch { /* large guild — use existing cache */ }
-
-  const textChannel = await getTextChannel(cfg.textChannelId);
-  const unmatched: ReassignItem[] = [];
-
-  for (const task of tasks) {
-    const taskMsg =
-      `📌 **Task from standup:**\n**${task.title}**` +
-      `${task.description ? `\n${task.description}` : ''}`;
-
-    const member = guild?.members.cache.find(
-      (m) =>
-        m.displayName.toLowerCase() === task.assignedTo.toLowerCase() ||
-        m.user.username.toLowerCase() === task.assignedTo.toLowerCase()
-    );
-
-    if (member) {
-      try {
-        await member.send(taskMsg);
-      } catch {
-        // DMs disabled — fall through to channel post
-        await textChannel.send(`<@${member.id}> ${taskMsg}`);
-      }
-    } else {
-      unmatched.push({
-        taskId: task._id.toString(),
-        assignedTo: task.assignedTo,
-        taskMsg,
-        cfg,
-      });
-    }
-  }
-
-  if (unmatched.length) {
-    await startReassignmentFlow(cfg.adminUserId, unmatched);
-  }
-}
-
-// ── Reassignment flow ─────────────────────────────────────────────────────────
-
-async function startReassignmentFlow(adminUserId: string, items: ReassignItem[]): Promise<void> {
-  let adminUser;
+  const guild = client.guilds.cache.get(meeting.guildId);
+  let displayName = discordUserId;
   try {
-    adminUser = await client.users.fetch(adminUserId);
-  } catch {
-    console.error(`[approval] Could not fetch admin for reassignment ${adminUserId}`);
-    return;
-  }
+    const member = guild?.members.cache.get(discordUserId) ?? await guild?.members.fetch(discordUserId);
+    if (member) displayName = member.displayName;
+  } catch { /* fallback to userId */ }
 
-  pendingReassignments.set(adminUserId, items);
-  await sendReassignPrompt(adminUser.dmChannel ?? await adminUser.createDM(), items[0]);
-}
+  await Task.findByIdAndUpdate(taskId, {
+    assignedDiscordId: discordUserId,
+    assignedTo: displayName,
+    approvedByAdmin: true,
+  });
 
-async function sendReassignPrompt(dm: DMChannel, item: ReassignItem): Promise<void> {
-  await dm.send(
-    `❓ **No Discord member found for "${item.assignedTo}"**\n` +
-    `Task: **${item.taskMsg.replace(/\*\*/g, '').trim()}**\n\n` +
-    `Reply with their Discord @mention or exact username, or reply \`skip\` to skip this task.`
+  await interaction.editReply(
+    buildTaskCard(taskId, task.title, task.description, task.assignedTo, 'assigned', discordUserId),
   );
 }
 
-async function processReassignmentReply(message: Message, queue: ReassignItem[]): Promise<void> {
-  const current = queue[0];
-  const reply   = message.content.trim();
-  const guild   = client.guilds.cache.get(current.cfg.guildId);
-  const textChannel = await getTextChannel(current.cfg.textChannelId);
+// ── Button: Edit Task (shows modal) ──────────────────────────────────────────
 
-  if (reply.toLowerCase() === 'skip') {
-    await message.reply(`⏭️ Skipped task for **${current.assignedTo}**.`);
-  } else {
-    const mentionMatch = reply.match(/^<@!?(\d+)>$/);
-    const member = mentionMatch
-      ? guild?.members.cache.get(mentionMatch[1])
-      : guild?.members.cache.find(
-          (m) =>
-            m.user.username.toLowerCase() === reply.toLowerCase() ||
-            m.displayName.toLowerCase() === reply.toLowerCase()
-        );
-
-    if (member) {
-      try {
-        await member.send(current.taskMsg);
-        await message.reply(`✅ Task sent to **${member.displayName}**.`);
-      } catch {
-        await textChannel.send(`<@${member.id}> ${current.taskMsg}`);
-        await message.reply(`✅ Task posted in channel (${member.displayName} has DMs disabled).`);
-      }
-      await Task.findByIdAndUpdate(current.taskId, { assignedTo: member.displayName });
-    } else {
-      await message.reply(`❌ Member **${reply}** not found. Skipping this task.`);
-    }
+export async function handleEditTaskButton(
+  interaction: ButtonInteraction,
+  taskId: string,
+): Promise<void> {
+  const task = await Task.findById(taskId).lean();
+  if (!task) {
+    await interaction.reply({ content: 'Task not found.', ephemeral: false });
+    return;
   }
 
-  queue.shift();
+  const modal = new ModalBuilder()
+    .setCustomId(`taskmodal_${taskId}`)
+    .setTitle('Edit Task');
 
-  if (queue.length > 0) {
-    await sendReassignPrompt(message.channel as DMChannel, queue[0]);
-  } else {
-    pendingReassignments.delete(message.author.id);
-    await (message.channel as DMChannel).send('✅ All unmatched tasks processed.');
+  const titleInput = new TextInputBuilder()
+    .setCustomId('taskTitle')
+    .setLabel('Title')
+    .setStyle(TextInputStyle.Short)
+    .setValue(task.title)
+    .setRequired(true);
+
+  const descInput = new TextInputBuilder()
+    .setCustomId('taskDescription')
+    .setLabel('Description (optional)')
+    .setStyle(TextInputStyle.Paragraph)
+    .setValue(task.description ?? '')
+    .setRequired(false);
+
+  modal.addComponents(
+    new ActionRowBuilder<TextInputBuilder>().addComponents(titleInput),
+    new ActionRowBuilder<TextInputBuilder>().addComponents(descInput),
+  );
+
+  await interaction.showModal(modal);
+}
+
+// ── Modal submit: task edit ───────────────────────────────────────────────────
+
+export async function handleTaskModalSubmit(
+  interaction: ModalSubmitInteraction,
+  taskId: string,
+): Promise<void> {
+  await interaction.deferUpdate();
+
+  const newTitle = interaction.fields.getTextInputValue('taskTitle').trim();
+  const newDescription = interaction.fields.getTextInputValue('taskDescription').trim() || undefined;
+
+  await Task.findByIdAndUpdate(taskId, { title: newTitle, description: newDescription });
+
+  const task = await Task.findById(taskId).lean();
+  if (!task) return;
+
+  const state = task.assignedDiscordId ? 'assigned' : 'pending';
+  await interaction.editReply(
+    buildTaskCard(taskId, task.title, task.description, task.assignedTo, state, task.assignedDiscordId),
+  );
+}
+
+// ── Button: Skip Task ─────────────────────────────────────────────────────────
+
+export async function handleSkipTaskButton(
+  interaction: ButtonInteraction,
+  taskId: string,
+): Promise<void> {
+  await interaction.deferUpdate();
+
+  const task = await Task.findById(taskId).lean();
+  if (!task) return;
+
+  await interaction.editReply(
+    buildTaskCard(taskId, task.title, task.description, task.assignedTo, 'skipped'),
+  );
+}
+
+// ── Button: Edit Summary ──────────────────────────────────────────────────────
+
+export async function handleEditSummaryButton(
+  interaction: ButtonInteraction,
+  meetingId: string,
+): Promise<void> {
+  pendingSummaryEdits.set(interaction.user.id, meetingId);
+  await interaction.reply('✏️ Send your edited summary as the next message in this DM.');
+}
+
+// ── Button: Dispatch Tasks ────────────────────────────────────────────────────
+
+export async function handleDispatchButton(
+  interaction: ButtonInteraction,
+  meetingId: string,
+): Promise<void> {
+  await interaction.deferUpdate();
+
+  const meeting = await Meeting.findById(meetingId).lean();
+  if (!meeting) return;
+
+  const cfg = await GuildConfig.findOne({ guildId: meeting.guildId, isActive: true }).lean();
+  if (!cfg) return;
+
+  const approval = await ApprovalRequest.findOne({ meetingId, status: 'pending' });
+  if (!approval) {
+    await interaction.followUp({ content: 'Already dispatched or not found.' });
+    return;
+  }
+
+  await ApprovalRequest.findByIdAndUpdate(approval._id, {
+    status: 'approved',
+    approvedAt: new Date(),
+  });
+
+  const textChannel = await getTextChannel(cfg.textChannelId);
+  await sendLongMessage(textChannel, approval.editedSummary ?? approval.originalSummary, '📋 **Summary**\n');
+
+  await dispatchTasksToAssignees(meetingId, cfg);
+  await textChannel.send('✅ Meeting ended.');
+
+  await interaction.editReply({ content: '✅ Tasks dispatched.', components: [] });
+  console.log(`[approval] Meeting ${meetingId} dispatched`);
+}
+
+// ── DM message handler (summary edit reply) ───────────────────────────────────
+
+export async function handleAdminDmMessage(message: Message): Promise<void> {
+  const meetingId = pendingSummaryEdits.get(message.author.id);
+  if (!meetingId) return;
+
+  pendingSummaryEdits.delete(message.author.id);
+  await ApprovalRequest.findOneAndUpdate(
+    { meetingId, adminUserId: message.author.id },
+    { editedSummary: message.content },
+  );
+  await message.reply('✅ Summary updated. Use the Dispatch button when ready.');
+}
+
+// ── Dispatch ──────────────────────────────────────────────────────────────────
+
+async function dispatchTasksToAssignees(meetingId: string, cfg: IGuildConfig): Promise<void> {
+  const tasks = await Task.find({ meetingId, assignedDiscordId: { $exists: true, $ne: null } }).lean();
+  if (!tasks.length) return;
+
+  const guild = client.guilds.cache.get(cfg.guildId);
+  try { await guild?.members.fetch(); } catch { /* large guild */ }
+
+  const textChannel = await getTextChannel(cfg.textChannelId);
+
+  for (const task of tasks) {
+    const taskMsg =
+      `📌 **Task assigned to you:**\n**${task.title}**` +
+      `${task.description ? `\n${task.description}` : ''}`;
+
+    try {
+      const member =
+        guild?.members.cache.get(task.assignedDiscordId!) ??
+        (await guild?.members.fetch(task.assignedDiscordId!));
+
+      if (member) {
+        try {
+          await member.send(taskMsg);
+        } catch {
+          await textChannel.send(`<@${task.assignedDiscordId}> ${taskMsg}`);
+        }
+      } else {
+        await textChannel.send(`<@${task.assignedDiscordId}> ${taskMsg}`);
+      }
+
+      await Task.findByIdAndUpdate(task._id, { dispatchedAt: new Date() });
+    } catch (err) {
+      console.error(`[approval] Dispatch error for task ${task._id}: ${err}`);
+    }
   }
 }
