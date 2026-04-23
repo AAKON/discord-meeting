@@ -25,6 +25,7 @@
     "@deepgram/sdk": "^5.0.0",
     "@discordjs/opus": "^0.10.0",
     "@discordjs/voice": "^0.19.2",
+    "@google/genai": "^1.50.1",
     "bullmq": "^5.74.1",
     "discord.js": "^14.26.3",
     "dotenv": "^17.4.2",

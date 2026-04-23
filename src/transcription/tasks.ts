@@ -1,10 +1,9 @@
-import Groq from 'groq-sdk';
+import { GoogleGenAI, Type } from '@google/genai';
 import { config } from '../config';
-import { TranscriptEntry } from '../db/models/transcript';
 import { Task } from '../db/models/task';
 import mongoose from 'mongoose';
 
-const groq = new Groq({ apiKey: config.GROQ_API_KEY });
+const ai = new GoogleGenAI({ apiKey: config.GOOGLE_API_KEY });
 
 interface ExtractedTask {
   assignedTo: string;
@@ -21,34 +20,47 @@ export async function extractTasksFromMeeting(
   const conversation = entries.map((e) => `${e.displayName}: ${e.text}`).join('\n');
 
   try {
-    const response = await groq.chat.completions.create({
-      model: 'llama-3.3-70b-versatile',
-      max_tokens: 1024,
-      messages: [
+    const response = await ai.models.generateContent({
+      model: config.GEMINI_MODEL,
+      contents: [
         {
           role: 'user',
-          content: `Extract all task assignments from this meeting conversation. The conversation may be in Bangla, English, or mixed.
+          parts: [
+            {
+              text: `Extract all task assignments from this meeting conversation. The conversation may be in Bangla, English, or mixed.
 
 Rules:
 1. "assignedTo" — use the EXACT name as spoken in the conversation, do NOT translate
 2. "title" — ALWAYS write in English; translate from Bangla if needed
 3. "description" — ALWAYS write in English; translate from Bangla if needed; omit if not present
 
-Return ONLY a JSON array with this exact format:
-[
-  {"assignedTo": "Person Name", "title": "Task title in English", "description": "optional details in English"},
-  ...
-]
-
-If no tasks are assigned, return an empty array: []
+If no tasks are assigned, return an empty array.
 
 Conversation:
 ${conversation}`,
+            },
+          ],
         },
       ],
+      config: {
+        maxOutputTokens: 1024,
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              assignedTo: { type: Type.STRING },
+              title: { type: Type.STRING },
+              description: { type: Type.STRING },
+            },
+            required: ['assignedTo', 'title'],
+          },
+        },
+      },
     });
 
-    const responseText = response.choices[0]?.message?.content ?? '[]';
+    const responseText = response.text ?? '[]';
 
     let tasks: ExtractedTask[] = [];
     try {
