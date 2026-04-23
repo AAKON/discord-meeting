@@ -70,8 +70,15 @@ async function handleSetup(interaction: ChatInputCommandInteraction): Promise<vo
     return;
   }
 
-  const vc = guild.channels.cache.get(voiceChannel.id);
-  const tc = guild.channels.cache.get(textChannel.id);
+  // Fetch channels explicitly — cache may be empty in freshly-joined servers
+  let vc, tc;
+  try {
+    vc = await guild.channels.fetch(voiceChannel.id);
+    tc = await guild.channels.fetch(textChannel.id);
+  } catch {
+    await interaction.editReply('Could not resolve the selected channels. Make sure the bot has **View Channel** permission.');
+    return;
+  }
 
   if (!vc || !botMember.permissionsIn(vc).has([PermissionFlagsBits.Connect, PermissionFlagsBits.Speak])) {
     await interaction.editReply(`Bot is missing **Connect** or **Speak** in <#${voiceChannel.id}>.`);
