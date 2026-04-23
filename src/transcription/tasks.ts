@@ -1,9 +1,9 @@
-import { GoogleGenAI, Type } from '@google/genai';
+import OpenAI from 'openai';
 import { config } from '../config';
 import { Task } from '../db/models/task';
 import mongoose from 'mongoose';
 
-const ai = new GoogleGenAI({ apiKey: config.GOOGLE_API_KEY });
+const client = new OpenAI({ apiKey: config.OPENAI_API_KEY });
 
 interface ExtractedTask {
   assignedTo: string;
@@ -20,52 +20,37 @@ export async function extractTasksFromMeeting(
   const conversation = entries.map((e) => `${e.displayName}: ${e.text}`).join('\n');
 
   try {
-    const response = await ai.models.generateContent({
-      model: config.GEMINI_MODEL,
-      contents: [
+    const response = await client.chat.completions.create({
+      model: config.OPENAI_MODEL,
+      max_tokens: 1024,
+      response_format: { type: 'json_object' },
+      messages: [
         {
           role: 'user',
-          parts: [
-            {
-              text: `Extract all task assignments from this meeting conversation. The conversation may be in Bangla, English, or mixed.
+          content: `Extract all task assignments from this meeting conversation. The conversation may be in Bangla, English, or mixed.
 
 Rules:
 1. "assignedTo" — use the EXACT name as spoken in the conversation, do NOT translate
 2. "title" — ALWAYS write in English; translate from Bangla if needed
 3. "description" — ALWAYS write in English; translate from Bangla if needed; omit if not present
 
-If no tasks are assigned, return an empty array.
+Return ONLY a JSON object with this exact format:
+{"tasks": [{"assignedTo": "Person Name", "title": "Task title in English", "description": "optional details in English"}]}
+
+If no tasks are assigned, return: {"tasks": []}
 
 Conversation:
 ${conversation}`,
-            },
-          ],
         },
       ],
-      config: {
-        maxOutputTokens: 1024,
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.ARRAY,
-          items: {
-            type: Type.OBJECT,
-            properties: {
-              assignedTo: { type: Type.STRING },
-              title: { type: Type.STRING },
-              description: { type: Type.STRING },
-            },
-            required: ['assignedTo', 'title'],
-          },
-        },
-      },
     });
 
-    const responseText = response.text ?? '[]';
+    const responseText = response.choices[0]?.message?.content ?? '{"tasks":[]}';
 
     let tasks: ExtractedTask[] = [];
     try {
-      tasks = JSON.parse(responseText);
-      if (!Array.isArray(tasks)) tasks = [];
+      const parsed = JSON.parse(responseText);
+      tasks = Array.isArray(parsed.tasks) ? parsed.tasks : Array.isArray(parsed) ? parsed : [];
     } catch {
       console.warn('[tasks] Failed to parse AI response as JSON, returning empty array');
       return [];
