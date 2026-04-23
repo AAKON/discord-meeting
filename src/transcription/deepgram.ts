@@ -19,7 +19,7 @@ export async function transcribeAudio(audioFilePath: string): Promise<string> {
     {
       method: 'POST',
       headers: {
-        Authorization: `Token ${config.DEEPGRAM_API_KEY}`,
+        Authorization: `Token ${config.DEEPGRAM_API_KEY ?? ''}`,
         'Content-Type': 'audio/wav',
       },
       body: audioBuffer,

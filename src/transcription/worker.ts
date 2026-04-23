@@ -2,7 +2,7 @@ import { Worker } from 'bullmq';
 import fs from 'fs';
 import mongoose from 'mongoose';
 import { config } from '../config';
-import { transcribeAudio } from './deepgram';
+import { transcribeAudio } from './index';
 import { TranscriptEntry } from '../db/models/transcript';
 import type { TranscriptionJobData } from '../queue';
 

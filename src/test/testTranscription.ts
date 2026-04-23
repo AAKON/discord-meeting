@@ -1,5 +1,5 @@
 import path from 'path';
-import { transcribeAudio } from '../transcription/deepgram';
+import { transcribeAudio } from '../transcription';
 
 const samplePath = path.resolve(__dirname, '../../test/sample.wav');
 
