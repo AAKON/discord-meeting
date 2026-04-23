@@ -424,7 +424,7 @@ export function registerEvents(): void {
       return;
     }
 
-    if (interaction.isUserSelectMenu()) {
+    if (interaction.isStringSelectMenu()) {
       const [action, id] = interaction.customId.split('_');
       if (action === 'assigntask') await handleTaskAssignSelect(interaction, id).catch(console.error);
       return;

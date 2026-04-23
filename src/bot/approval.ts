@@ -7,10 +7,11 @@ import {
   Message,
   ModalBuilder,
   ModalSubmitInteraction,
+  StringSelectMenuBuilder,
+  StringSelectMenuInteraction,
+  StringSelectMenuOptionBuilder,
   TextInputBuilder,
   TextInputStyle,
-  UserSelectMenuBuilder,
-  UserSelectMenuInteraction,
 } from 'discord.js';
 import { client } from './index';
 import { GuildConfig, IGuildConfig } from '../db/models/guildConfig';
@@ -23,6 +24,10 @@ import { sendLongMessage } from './utils';
 // adminUserId → meetingId (waiting for summary edit DM reply)
 const pendingSummaryEdits = new Map<string, string>();
 
+// meetingId → guild member options for StringSelectMenu
+interface MemberOption { label: string; description: string; value: string }
+const memberOptionsCache = new Map<string, MemberOption[]>();
+
 // ── Task card builder ─────────────────────────────────────────────────────────
 
 function buildTaskCard(
@@ -31,6 +36,7 @@ function buildTaskCard(
   description: string | undefined,
   suggestedName: string,
   state: 'pending' | 'assigned' | 'skipped',
+  memberOptions: MemberOption[],
   assignedDiscordId?: string,
 ) {
   const assignedValue =
@@ -50,12 +56,16 @@ function buildTaskCard(
     )
     .setColor(state === 'assigned' ? 0x57f287 : state === 'skipped' ? 0x95a5a6 : 0x5865f2);
 
-  const selectRow = new ActionRowBuilder<UserSelectMenuBuilder>().addComponents(
-    new UserSelectMenuBuilder()
-      .setCustomId(`assigntask_${taskId}`)
-      .setPlaceholder('Select member to assign')
-      .setDisabled(state !== 'pending'),
-  );
+  const displayOptions = memberOptions.length > 0 ? memberOptions : [{ label: 'No members found', description: '', value: 'none' }];
+  const selectMenu = new StringSelectMenuBuilder()
+    .setCustomId(`assigntask_${taskId}`)
+    .setPlaceholder('Select member to assign')
+    .setDisabled(state !== 'pending')
+    .addOptions(displayOptions.map((o) =>
+      new StringSelectMenuOptionBuilder().setLabel(o.label).setDescription(o.description).setValue(o.value),
+    ));
+
+  const selectRow = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(selectMenu);
 
   const btnRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
@@ -91,6 +101,19 @@ export async function startApprovalWorkflow(
   const tasks = await Task.find({ meetingId }).lean();
   const dm = await adminUser.createDM();
 
+  // Fetch all guild members and cache options for select menus
+  const guild = client.guilds.cache.get(cfg.guildId);
+  try { await guild?.members.fetch(); } catch { /* large guild, use cache */ }
+  const memberOptions: MemberOption[] = (guild?.members.cache
+    .filter((m) => !m.user.bot)
+    .map((m) => ({
+      label: m.displayName.slice(0, 100),
+      description: `@${m.user.username}`.slice(0, 100),
+      value: m.id,
+    }))
+    .slice(0, 25)) ?? [];
+  memberOptionsCache.set(meetingId, memberOptions);
+
   // Summary card
   const summaryEmbed = new EmbedBuilder()
     .setTitle('📋 Meeting Summary')
@@ -108,7 +131,7 @@ export async function startApprovalWorkflow(
 
   // One task card per task
   for (const task of tasks) {
-    await dm.send(buildTaskCard(task._id.toString(), task.title, task.description, task.assignedTo, 'pending'));
+    await dm.send(buildTaskCard(task._id.toString(), task.title, task.description, task.assignedTo, 'pending', memberOptions));
   }
 
   // Dispatch button
@@ -139,15 +162,17 @@ export async function startApprovalWorkflow(
   console.log(`[approval] Workflow started for meeting ${meetingId}`);
 }
 
-// ── UserSelectMenu: assign task ───────────────────────────────────────────────
+// ── StringSelectMenu: assign task ────────────────────────────────────────────
 
 export async function handleTaskAssignSelect(
-  interaction: UserSelectMenuInteraction,
+  interaction: StringSelectMenuInteraction,
   taskId: string,
 ): Promise<void> {
   await interaction.deferUpdate();
 
   const discordUserId = interaction.values[0];
+  if (discordUserId === 'none') return;
+
   const task = await Task.findById(taskId).lean();
   if (!task) return;
 
@@ -155,11 +180,8 @@ export async function handleTaskAssignSelect(
   if (!meeting) return;
 
   const guild = client.guilds.cache.get(meeting.guildId);
-  let displayName = discordUserId;
-  try {
-    const member = guild?.members.cache.get(discordUserId) ?? await guild?.members.fetch(discordUserId);
-    if (member) displayName = member.displayName;
-  } catch { /* fallback to userId */ }
+  const member = guild?.members.cache.get(discordUserId);
+  const displayName = member?.displayName ?? discordUserId;
 
   await Task.findByIdAndUpdate(taskId, {
     assignedDiscordId: discordUserId,
@@ -167,8 +189,9 @@ export async function handleTaskAssignSelect(
     approvedByAdmin: true,
   });
 
+  const memberOptions = memberOptionsCache.get(meeting._id.toString()) ?? [];
   await interaction.editReply(
-    buildTaskCard(taskId, task.title, task.description, task.assignedTo, 'assigned', discordUserId),
+    buildTaskCard(taskId, task.title, task.description, task.assignedTo, 'assigned', memberOptions, discordUserId),
   );
 }
 
@@ -226,9 +249,11 @@ export async function handleTaskModalSubmit(
   const task = await Task.findById(taskId).lean();
   if (!task) return;
 
+  const meetingId = task.meetingId.toString();
+  const memberOptions = memberOptionsCache.get(meetingId) ?? [];
   const state = task.assignedDiscordId ? 'assigned' : 'pending';
   await interaction.editReply(
-    buildTaskCard(taskId, task.title, task.description, task.assignedTo, state, task.assignedDiscordId),
+    buildTaskCard(taskId, task.title, task.description, task.assignedTo, state, memberOptions, task.assignedDiscordId),
   );
 }
 
@@ -243,8 +268,9 @@ export async function handleSkipTaskButton(
   const task = await Task.findById(taskId).lean();
   if (!task) return;
 
+  const memberOptions = memberOptionsCache.get(task.meetingId.toString()) ?? [];
   await interaction.editReply(
-    buildTaskCard(taskId, task.title, task.description, task.assignedTo, 'skipped'),
+    buildTaskCard(taskId, task.title, task.description, task.assignedTo, 'skipped', memberOptions),
   );
 }
 
