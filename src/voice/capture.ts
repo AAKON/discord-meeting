@@ -87,6 +87,9 @@ function startUserStream(
     });
 
     const decoder = new prism.opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 });
+    decoder.on('error', (err) => {
+      console.warn(`[capture] Opus decode error for ${displayName} (skipping packet): ${err.message}`);
+    });
     subscription.pipe(decoder).pipe(writeStream);
 
     const timer = setTimeout(async () => {
