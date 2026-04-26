@@ -13,7 +13,7 @@ const configSchema = z
     OPENAI_MODEL: z.string().default('gpt-4o-mini'),
     OPENAI_STT_MODEL: z.string().default('whisper-1'),
     OPENAI_STT_LANGUAGE: z.string().default('bn'),
-    TRANSCRIPTION_PROVIDER: z.enum(['deepgram', 'google', 'openai']).default('openai'),
+    TRANSCRIPTION_PROVIDER: z.enum(['deepgram', 'google', 'openai', 'groq']).default('groq'),
     DEEPGRAM_API_KEY: z.string().optional(),
     GOOGLE_API_KEY: z.string().optional(),
     GOOGLE_STT_LANGUAGE: z.string().default('bn-BD'),
@@ -26,6 +26,10 @@ const configSchema = z
   .refine(
     (data) => data.TRANSCRIPTION_PROVIDER !== 'google' || !!data.GOOGLE_API_KEY,
     { message: 'GOOGLE_API_KEY required when TRANSCRIPTION_PROVIDER=google', path: ['GOOGLE_API_KEY'] }
+  )
+  .refine(
+    (data) => data.TRANSCRIPTION_PROVIDER !== 'groq' || !!data.GROQ_API_KEY,
+    { message: 'GROQ_API_KEY required when TRANSCRIPTION_PROVIDER=groq', path: ['GROQ_API_KEY'] }
   );
 
 const parsed = configSchema.safeParse(process.env);

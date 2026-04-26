@@ -7,7 +7,7 @@ export interface ITask extends Document {
   title: string;
   description?: string;
   dueDate?: Date;
-  status: 'assigned' | 'in_progress' | 'completed' | 'pending';
+  status: 'assigned' | 'in_progress' | 'completed' | 'pending' | 'skipped';
   assignedBy?: string;
   approvedByAdmin: boolean;
   dispatchedAt?: Date;
@@ -25,7 +25,7 @@ const TaskSchema = new Schema<ITask>(
     dueDate: { type: Date },
     status: {
       type: String,
-      enum: ['assigned', 'in_progress', 'completed', 'pending'],
+      enum: ['assigned', 'in_progress', 'completed', 'pending', 'skipped'],
       default: 'assigned',
     },
     assignedBy: { type: String },

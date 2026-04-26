@@ -1,9 +1,9 @@
 import {
   ChatInputCommandInteraction,
+  GuildMember,
   PermissionFlagsBits,
   TextChannel,
 } from 'discord.js';
-import { VoiceConnection } from '@discordjs/voice';
 import { client } from './index';
 import { Meeting } from '../db/models/meeting';
 import { TranscriptEntry } from '../db/models/transcript';
@@ -27,10 +27,7 @@ import { sendLongMessage } from './utils';
 import { getTasksByAssignee } from '../transcription/tasks';
 import mongoose from 'mongoose';
 
-// ── Shims for index.ts reconnect logic — fully replaced in Step 11 ──────────
-export function getActiveMeetingId(): string | null { return null; }
-export function getActiveConnection(): VoiceConnection | null { return null; }
-export function setActiveConnection(_c: VoiceConnection | null): void { /* Step 11 */ }
+
 
 // ── /setup ───────────────────────────────────────────────────────────────────
 
@@ -156,6 +153,35 @@ async function handleStartMeeting(interaction: ChatInputCommandInteraction): Pro
 
 // ── /schedule-meeting ─────────────────────────────────────────────────────────
 
+/**
+ * Convert a local date+time string ("YYYY-MM-DD" + "HH:MM") in a given IANA
+ * timezone into a UTC Date, using only the built-in Intl API.
+ */
+function zonedToUtc(date: string, time: string, timezone: string): Date {
+  // Build an ISO-like string and treat it as a wall-clock time in `timezone`.
+  // We rely on the fact that Intl.DateTimeFormat can tell us the UTC offset
+  // for a specific moment expressed in that timezone.
+  const localIso = `${date}T${time}:00`;
+
+  // First guess: assume it's UTC and see how far off the TZ offset is.
+  const guess = new Date(`${localIso}Z`);
+
+  // Format the guess back in the target timezone to get the local time fields.
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: timezone,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+    hour12: false,
+  }).formatToParts(guess);
+
+  const get = (type: string) => parts.find((p) => p.type === type)?.value ?? '00';
+  const localDateFromGuess = `${get('year')}-${get('month')}-${get('day')}T${get('hour')}:${get('minute')}:${get('second')}Z`;
+  const offsetMs = new Date(localDateFromGuess).getTime() - guess.getTime();
+
+  // Subtract the offset to get the correct UTC time.
+  return new Date(guess.getTime() - offsetMs);
+}
+
 async function handleScheduleMeeting(interaction: ChatInputCommandInteraction): Promise<void> {
   await interaction.deferReply();
   const cfg = await requireGuildConfig(interaction.guildId!);
@@ -165,7 +191,14 @@ async function handleScheduleMeeting(interaction: ChatInputCommandInteraction): 
   const time           = interaction.options.getString('time', true);
   const participantRaw = interaction.options.getString('participants');
 
-  const scheduledTime = new Date(`${date}T${time}:00`);
+  // Validate raw format before conversion
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !/^\d{2}:\d{2}$/.test(time)) {
+    await interaction.editReply('Invalid format. Use `YYYY-MM-DD` for date and `HH:MM` for time.');
+    return;
+  }
+
+  // Parse the date+time in the guild's configured timezone (not server local time)
+  const scheduledTime = zonedToUtc(date, time, cfg.timezone);
   if (isNaN(scheduledTime.getTime()) || scheduledTime <= new Date()) {
     await interaction.editReply('Invalid date/time, or the time is in the past.');
     return;
@@ -243,21 +276,32 @@ async function handleAssignTask(interaction: ChatInputCommandInteraction): Promi
     return;
   }
 
-  const assignedTo  = interaction.options.getString('assigned-to', true);
-  const title       = interaction.options.getString('title', true);
-  const description = interaction.options.getString('description');
+  // Use a Discord User option so we always have the Discord ID for DM dispatch
+  const assignedUser  = interaction.options.getMember('assigned-to') as GuildMember | null;
+  const title         = interaction.options.getString('title', true);
+  const description   = interaction.options.getString('description');
+
+  if (!assignedUser) {
+    await interaction.editReply('Could not resolve the mentioned member.');
+    return;
+  }
+
+  const assignedDiscordId = assignedUser.id;
+  const displayName       = assignedUser.displayName;
 
   await Task.create({
-    meetingId: new mongoose.Types.ObjectId(active.meetingId),
-    assignedTo,
+    meetingId:        new mongoose.Types.ObjectId(active.meetingId),
+    assignedTo:       displayName,
+    assignedDiscordId,
     title,
-    description: description ?? undefined,
-    status: 'assigned',
+    description:      description ?? undefined,
+    status:           'assigned',
+    approvedByAdmin:  true,   // manually assigned by whoever ran the command
   });
 
   const textChannel = await getTextChannel(cfg.textChannelId);
   await textChannel.send(
-    `📌 **Task Assigned**\n👤 **${assignedTo}**: ${title}${description ? `\n${description}` : ''}`
+    `📌 **Task Assigned**\n<@${assignedDiscordId}> **${displayName}**: ${title}${description ? `\n${description}` : ''}`
   );
   await interaction.editReply('Task assigned.');
 }

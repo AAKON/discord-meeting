@@ -9,6 +9,7 @@ export interface IApprovalRequest extends Document {
   status: ApprovalStatus;
   originalSummary: string;
   editedSummary?: string;
+  isPendingSummaryEdit: boolean;
   sentToAdminAt: Date;
   approvedAt?: Date;
   createdAt: Date;
@@ -27,6 +28,7 @@ const ApprovalRequestSchema = new Schema<IApprovalRequest>(
     },
     originalSummary: { type: String, required: true },
     editedSummary: { type: String },
+    isPendingSummaryEdit: { type: Boolean, default: false },
     sentToAdminAt: { type: Date, required: true },
     approvedAt: { type: Date },
   },

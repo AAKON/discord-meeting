@@ -91,8 +91,8 @@ const commands = [
   new SlashCommandBuilder()
     .setName('assign-task')
     .setDescription('Manually assign a task to someone during a meeting')
-    .addStringOption((opt) =>
-      opt.setName('assigned-to').setDescription('Who the task is assigned to').setRequired(true)
+    .addUserOption((opt) =>
+      opt.setName('assigned-to').setDescription('The server member to assign the task to').setRequired(true)
     )
     .addStringOption((opt) =>
       opt.setName('title').setDescription('Task title').setRequired(true)

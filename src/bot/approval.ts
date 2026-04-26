@@ -22,13 +22,43 @@ import { getTextChannel } from '../utils/discord';
 import { sendLongMessage } from './utils';
 
 // adminUserId → meetingId (waiting for summary edit DM reply)
+// This map is populated from the DB on startup via hydrateApprovalState().
 const pendingSummaryEdits = new Map<string, string>();
 
-// meetingId → guild member options for StringSelectMenu
-interface MemberOption { label: string; description: string; value: string }
-const memberOptionsCache = new Map<string, MemberOption[]>();
+// ── Hydrate in-memory state from DB on startup ────────────────────────────────
+// Call this once after the bot logs in to restore any pending DM edit sessions
+// that existed before a restart.
+export async function hydrateApprovalState(): Promise<void> {
+  const pending = await ApprovalRequest.find({
+    status: 'pending',
+    isPendingSummaryEdit: true,
+  });
+  for (const req of pending) {
+    pendingSummaryEdits.set(req.adminUserId, req.meetingId.toString());
+  }
+  if (pending.length > 0) {
+    console.log(`[approval] Restored ${pending.length} pending summary edit session(s) from DB`);
+  }
+}
 
-// ── Task card builder ─────────────────────────────────────────────────────────
+// ── Guild member options (fetched on-demand, not cached in memory) ───────────
+
+interface MemberOption { label: string; description: string; value: string }
+
+async function fetchMemberOptions(guildId: string): Promise<MemberOption[]> {
+  const guild = client.guilds.cache.get(guildId);
+  if (!guild) return [];
+  try { await guild.members.fetch(); } catch { /* large guild, use cache */ }
+  return guild.members.cache
+    .filter((m) => !m.user.bot)
+    .map((m) => ({
+      label: m.displayName.slice(0, 100),
+      description: `@${m.user.username}`.slice(0, 100),
+      value: m.id,
+    }))
+    .slice(0, 25);
+}
+
 
 function buildTaskCard(
   taskId: string,
@@ -101,18 +131,8 @@ export async function startApprovalWorkflow(
   const tasks = await Task.find({ meetingId }).lean();
   const dm = await adminUser.createDM();
 
-  // Fetch all guild members and cache options for select menus
-  const guild = client.guilds.cache.get(cfg.guildId);
-  try { await guild?.members.fetch(); } catch { /* large guild, use cache */ }
-  const memberOptions: MemberOption[] = (guild?.members.cache
-    .filter((m) => !m.user.bot)
-    .map((m) => ({
-      label: m.displayName.slice(0, 100),
-      description: `@${m.user.username}`.slice(0, 100),
-      value: m.id,
-    }))
-    .slice(0, 25)) ?? [];
-  memberOptionsCache.set(meetingId, memberOptions);
+  // Fetch all guild members on-demand (not cached in memory)
+  const memberOptions = await fetchMemberOptions(cfg.guildId);
 
   // Summary card
   const summaryEmbed = new EmbedBuilder()
@@ -189,7 +209,7 @@ export async function handleTaskAssignSelect(
     approvedByAdmin: true,
   });
 
-  const memberOptions = memberOptionsCache.get(meeting._id.toString()) ?? [];
+  const memberOptions = await fetchMemberOptions(meeting.guildId);
   await interaction.editReply(
     buildTaskCard(taskId, task.title, task.description, task.assignedTo, 'assigned', memberOptions, discordUserId),
   );
@@ -250,7 +270,9 @@ export async function handleTaskModalSubmit(
   if (!task) return;
 
   const meetingId = task.meetingId.toString();
-  const memberOptions = memberOptionsCache.get(meetingId) ?? [];
+  const memberOptions = await fetchMemberOptions(
+    (await Meeting.findById(task.meetingId).lean())?.guildId ?? ''
+  );
   const state = task.assignedDiscordId ? 'assigned' : 'pending';
   await interaction.editReply(
     buildTaskCard(taskId, task.title, task.description, task.assignedTo, state, memberOptions, task.assignedDiscordId),
@@ -268,7 +290,16 @@ export async function handleSkipTaskButton(
   const task = await Task.findById(taskId).lean();
   if (!task) return;
 
-  const memberOptions = memberOptionsCache.get(task.meetingId.toString()) ?? [];
+  // Persist the skipped state to DB so the dispatch step won't include this task.
+  // Also clear assignedDiscordId in case the admin had previously assigned then changed their mind.
+  await Task.findByIdAndUpdate(taskId, {
+    status: 'skipped',
+    assignedDiscordId: undefined,
+    approvedByAdmin: false,
+  });
+
+  const meeting = await Meeting.findById(task.meetingId).lean();
+  const memberOptions = await fetchMemberOptions(meeting?.guildId ?? '');
   await interaction.editReply(
     buildTaskCard(taskId, task.title, task.description, task.assignedTo, 'skipped', memberOptions),
   );
@@ -280,7 +311,13 @@ export async function handleEditSummaryButton(
   interaction: ButtonInteraction,
   meetingId: string,
 ): Promise<void> {
+  // Record the pending DM session both in-memory and in the DB
+  // so it survives a bot restart.
   pendingSummaryEdits.set(interaction.user.id, meetingId);
+  await ApprovalRequest.findOneAndUpdate(
+    { meetingId, status: 'pending' },
+    { isPendingSummaryEdit: true },
+  );
   await interaction.reply('✏️ Send your edited summary as the next message in this DM.');
 }
 
@@ -326,17 +363,24 @@ export async function handleAdminDmMessage(message: Message): Promise<void> {
   if (!meetingId) return;
 
   pendingSummaryEdits.delete(message.author.id);
+  // Clear the pending-edit flag in DB and save the edited summary
   await ApprovalRequest.findOneAndUpdate(
     { meetingId, adminUserId: message.author.id },
-    { editedSummary: message.content },
+    { editedSummary: message.content, isPendingSummaryEdit: false },
   );
   await message.reply('✅ Summary updated. Use the Dispatch button when ready.');
 }
 
 // ── Dispatch ──────────────────────────────────────────────────────────────────
 
+// Only dispatch tasks that are 'assigned' with a valid Discord ID.
+// Tasks that were skipped (status: 'skipped') are excluded automatically.
 async function dispatchTasksToAssignees(meetingId: string, cfg: IGuildConfig): Promise<void> {
-  const tasks = await Task.find({ meetingId, assignedDiscordId: { $exists: true, $ne: null } }).lean();
+  const tasks = await Task.find({
+    meetingId,
+    status: { $nin: ['skipped', 'pending'] },
+    assignedDiscordId: { $exists: true, $ne: null },
+  }).lean();
   if (!tasks.length) return;
 
   const guild = client.guilds.cache.get(cfg.guildId);

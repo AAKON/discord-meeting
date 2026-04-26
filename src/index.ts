@@ -13,6 +13,7 @@ import { startVoiceCapture, resetCapture } from './voice/capture';
 import { transcriptionQueue } from './queue';
 import { buildParticipantMap, getTextChannel } from './utils/discord';
 import { meetingState } from './bot/meetingState';
+import { hydrateApprovalState } from './bot/approval';
 
 const MAX_RECONNECT_ATTEMPTS = 3;
 
@@ -64,7 +65,9 @@ async function attemptReconnect(meetingId: string, guildId: string, attempt = 1)
     startVoiceCapture(connection, meetingId, participants);
     console.log('[reconnect] Voice capture restarted.');
 
-    connection.on('stateChange', (_old, newState) => {
+    // Use .once() — not .on() — so each connection object only fires a single
+    // reconnect cycle rather than accumulating a listener on every attempt.
+    connection.once('stateChange', (_old, newState) => {
       if (newState.status === VoiceConnectionStatus.Disconnected && meetingState.has(guildId)) {
         attemptReconnect(meetingId, guildId, 1).catch(console.error);
       }
@@ -90,6 +93,7 @@ async function main(): Promise<void> {
     await registerCommands();
     await startAllSchedulers();
     await rescheduleOneOffMeetings();
+    await hydrateApprovalState();
     console.log('[app] Schedulers started');
   });
 
