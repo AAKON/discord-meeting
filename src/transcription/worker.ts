@@ -1,4 +1,4 @@
-import { Worker } from 'bullmq';
+import { Worker, Queue } from 'bullmq';
 import fs from 'fs';
 import mongoose from 'mongoose';
 import { config } from '../config';
@@ -9,6 +9,15 @@ import type { TranscriptionJobData } from '../queue';
 const connection = { url: config.REDIS_URL };
 
 export function startTranscriptionWorker(): Worker<TranscriptionJobData> {
+  // If the bot crashed or was force-killed while the queue was paused (e.g. during
+  // shutdown), the Redis key `bull:transcription-queue:paused` is left behind.
+  // BullMQ logs this as an error and the worker silently refuses to process jobs.
+  // We proactively resume on every startup to clear that stale state.
+  const queue = new Queue<TranscriptionJobData>('transcription-queue', { connection });
+  queue.resume()
+    .then(() => console.log('[worker] Transcription queue resumed'))
+    .catch((err) => console.warn('[worker] Queue resume skipped (already running):', err?.message));
+
   const worker = new Worker<TranscriptionJobData>(
     'transcription-queue',
     async (job) => {
@@ -48,6 +57,11 @@ export function startTranscriptionWorker(): Worker<TranscriptionJobData> {
     if (filePath && fs.existsSync(filePath)) {
       try { fs.unlinkSync(filePath); } catch { /* ignore */ }
     }
+  });
+
+  // Surface BullMQ internal errors with a readable message instead of a raw Redis key
+  worker.on('error', (err) => {
+    console.error('[worker] BullMQ worker error:', err.message);
   });
 
   return worker;
