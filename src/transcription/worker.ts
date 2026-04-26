@@ -1,68 +1,42 @@
-import { Worker, Queue } from 'bullmq';
 import fs from 'fs';
 import mongoose from 'mongoose';
-import { config } from '../config';
 import { transcribeAudio } from './index';
 import { TranscriptEntry } from '../db/models/transcript';
-import type { TranscriptionJobData } from '../queue';
+import { transcriptionQueue, type TranscriptionJobData } from '../queue';
 
-const connection = { url: config.REDIS_URL };
+/**
+ * Registers the transcription processor with the in-process queue.
+ * No BullMQ / Redis involved — jobs run directly in this process.
+ */
+export function startTranscriptionWorker(): void {
+  transcriptionQueue.setProcessor(async (data: TranscriptionJobData) => {
+    const { meetingId, userId, displayName, audioFilePath, chunkIndex, timestamp, flushTime } = data;
 
-export function startTranscriptionWorker(): Worker<TranscriptionJobData> {
-  // If the bot crashed or was force-killed while the queue was paused (e.g. during
-  // shutdown), the Redis key `bull:transcription-queue:paused` is left behind.
-  // BullMQ logs this as an error and the worker silently refuses to process jobs.
-  // We proactively resume on every startup to clear that stale state.
-  const queue = new Queue<TranscriptionJobData>('transcription-queue', { connection });
-  queue.resume()
-    .then(() => console.log('[worker] Transcription queue resumed'))
-    .catch((err) => console.warn('[worker] Queue resume skipped (already running):', err?.message));
-
-  const worker = new Worker<TranscriptionJobData>(
-    'transcription-queue',
-    async (job) => {
-      const { meetingId, userId, displayName, audioFilePath, chunkIndex, timestamp, flushTime } = job.data;
-
-      if (!fs.existsSync(audioFilePath)) {
-        console.warn(`[worker] Audio file not found, skipping: ${audioFilePath}`);
-        return;
-      }
-
-      const text = await transcribeAudio(audioFilePath);
-
-      if (!text.trim()) {
-        fs.unlinkSync(audioFilePath);
-        return;
-      }
-
-      await TranscriptEntry.create({
-        meetingId: new mongoose.Types.ObjectId(meetingId),
-        discordUserId: userId,
-        displayName,
-        startTimestamp: new Date(timestamp),
-        endTimestamp: new Date(flushTime),
-        text,
-        chunkIndex,
-      });
-
-      fs.unlinkSync(audioFilePath);
-      console.log(`[transcript] ${displayName} (chunk ${chunkIndex}): ${text}`);
-    },
-    { connection, concurrency: 5 }
-  );
-
-  worker.on('failed', (job, err) => {
-    console.error(`[worker] Job ${job?.id} failed: ${err.message}`);
-    const filePath = job?.data.audioFilePath;
-    if (filePath && fs.existsSync(filePath)) {
-      try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+    if (!fs.existsSync(audioFilePath)) {
+      console.warn(`[worker] Audio file not found, skipping: ${audioFilePath}`);
+      return;
     }
+
+    const text = await transcribeAudio(audioFilePath);
+
+    if (!text.trim()) {
+      fs.unlinkSync(audioFilePath);
+      return;
+    }
+
+    await TranscriptEntry.create({
+      meetingId: new mongoose.Types.ObjectId(meetingId),
+      discordUserId: userId,
+      displayName,
+      startTimestamp: new Date(timestamp),
+      endTimestamp:   new Date(flushTime),
+      text,
+      chunkIndex,
+    });
+
+    fs.unlinkSync(audioFilePath);
+    console.log(`[transcript] ${displayName} (chunk ${chunkIndex}): ${text}`);
   });
 
-  // Surface BullMQ internal errors with a readable message instead of a raw Redis key
-  worker.on('error', (err) => {
-    console.error('[worker] BullMQ worker error:', err.message);
-  });
-
-  return worker;
+  console.log('[worker] In-process transcription worker ready (no Redis)');
 }

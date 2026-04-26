@@ -1,11 +1,12 @@
-import { Queue } from 'bullmq';
+import { transcriptionQueue } from '../queue';
 
-export async function waitForQueueDrain(queue: Queue, timeoutMs = 60_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const counts = await queue.getJobCounts('active', 'waiting', 'delayed');
-    if (counts.active + counts.waiting + counts.delayed === 0) return;
-    await new Promise((r) => setTimeout(r, 1000));
-  }
-  console.warn('[queue] Drain timeout reached — some jobs may still be running');
+/**
+ * Waits for all active and pending transcription jobs to finish.
+ * Delegates to the in-process queue's built-in drain() method.
+ */
+export async function waitForQueueDrain(
+  _queue: typeof transcriptionQueue,
+  timeoutMs = 60_000,
+): Promise<void> {
+  await transcriptionQueue.drain(timeoutMs);
 }
